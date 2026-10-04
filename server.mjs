@@ -1,23 +1,17 @@
 import http from 'node:http';
 import {spawn} from 'node:child_process';
 import {createInterface} from 'node:readline';
-import {readFileSync,writeFileSync,mkdirSync,existsSync,statSync,renameSync,readdirSync,unlinkSync} from 'node:fs';
+import {readFileSync,writeFileSync,mkdirSync,existsSync,statSync,renameSync} from 'node:fs';
 import {fileURLToPath} from 'node:url';
 import path from 'node:path';
 import {randomUUID,randomBytes} from 'node:crypto';
 import {createState,record,ensureAgent,reduceEvent,compareThreadRecency} from './monitor.mjs';
+import {roleDefaults,writeAgentDefinitions} from './agent-config.mjs';
 
 const root=path.dirname(fileURLToPath(import.meta.url));
 const port=Number(process.env.PORT||4310), origin=`http://127.0.0.1:${port}`;
 const dataDir=path.join(root,'data');mkdirSync(dataDir,{recursive:true});
 const configFile=path.join(dataDir,'config.json'), historyFile=path.join(dataDir,'history.json');
-const roleDefaults=[
-  {name:'explorer',description:'สำรวจ repository และส่งหลักฐานให้ Coordinator โดยไม่แก้ไฟล์',model:'gpt-6-luna',reasoningEffort:'',sandboxMode:'read-only',instructions:'Inspect only the files and code paths relevant to the task. Trace current behavior, tests, and evidence. Do not modify files. Return relevant files, code paths, current behavior, evidence, risks, and unknowns concisely.'},
-  {name:'planner',description:'วิเคราะห์ root cause และวางแผนสำหรับงานซับซ้อน โดยไม่ลงมือแก้',model:'gpt-6.1-sol',reasoningEffort:'medium',sandboxMode:'read-only',instructions:'Act as the senior planning agent. Use only the concise evidence supplied by the coordinator. Do not modify files. Return root cause, smallest safe solution, files and exact logic to change, risks, needed checks, and implementation order.'},
-  {name:'worker',description:'ลงมือ implement ตามขอบเขตที่ Coordinator มอบหมาย',model:'gpt-6-luna',reasoningEffort:'medium',sandboxMode:'',instructions:'Implement the assigned change using the approved scope. Modify only necessary files, preserve unrelated behavior, follow project conventions, and inspect the final diff. If blocked, stop and return evidence instead of redesigning the plan.'},
-  {name:'reviewer',description:'ตรวจ implementation งานทั่วไป หา regression และ edge cases',model:'gpt-6-luna',reasoningEffort:'medium',sandboxMode:'read-only',instructions:'Review the implementation for correctness, regressions, scope creep, edge cases, and missing checks. Do not modify files. Return PASS or NEEDS_CHANGES followed by concrete findings and recommended checks.'},
-  {name:'senior_reviewer',description:'ตรวจงานเสี่ยงสูง เช่น business logic, migration, API หรือ architecture ด้วย Sol',model:'gpt-6.1-sol',reasoningEffort:'high',sandboxMode:'read-only',instructions:'Review high-risk business logic, migrations, public APIs, and architecture decisions. Check correctness, data integrity, regressions, security, and missing edge cases. Do not modify files. Lead with concrete findings and state PASS or NEEDS_CHANGES.'}
-];
 const defaultCoordinatorInstructions='You are the coordinator and implementation owner. Start by assessing scope. Handle small, clear tasks directly or delegate one focused implementation task to worker; do not spawn agents just because slots are available. Use explorer for targeted read-only investigation when context is unclear. Escalate to planner only for uncertain root causes, cross-service/data-flow bugs, migrations, architecture, high-risk logic, repeated failed fixes, or several tightly related files. Give planner only concise relevant evidence, then return to worker for implementation. Use reviewer for ordinary changes and senior_reviewer only for high-risk work. Wait for every delegated result before proceeding or summarizing. Prefer Luna for exploration, implementation, and routine checks; use Sol for planning and high-risk review. Avoid sending the whole repository to Sol and avoid concurrent edits to the same files. Every subagent should start with a brief visible commentary line beginning with \"งาน: \".';
 const defaults={version:2,workspace:root,model:'gpt-6-luna',reasoningEffort:'medium',maxAgents:5,maxSolAgents:2,tokenRates:{},approvalPolicy:'on-request',sandboxMode:'workspace-write',coordinatorInstructions:defaultCoordinatorInstructions,roles:roleDefaults};
 const legacyInstructions={explorer:'Inspect the project and gather evidence. Return concise findings.',worker:'Implement the assigned change and verify it.',reviewer:'Review correctness and risks. Return actionable findings.'};
@@ -199,43 +193,6 @@ function validateConfig(value) {
   });
   if(new Set(roles.map(r=>r.name)).size!==roles.length)throw Error('Role names must be unique');
   return {version:2,workspace:path.resolve(value.workspace),model:value.model,reasoningEffort,maxAgents:value.maxAgents,maxSolAgents,tokenRates,approvalPolicy,sandboxMode,coordinatorInstructions:value.coordinatorInstructions,roles};
-}
-const agentMarker='# Managed by Acode Agent Control.';
-const agentPath=(workspace,name)=>path.join(workspace,'.codex','agents','acode-'+name+'.toml');
-function agentName(contents){return contents.match(/^name\s*=\s*["']([^"']+)["']/m)?.[1]||'';}
-function agentToml(role) {
-  const lines=[agentMarker,'name = '+JSON.stringify(role.name),'description = '+JSON.stringify(role.description)];
-  if(role.model)lines.push('model = '+JSON.stringify(role.model));
-  if(role.reasoningEffort)lines.push('model_reasoning_effort = '+JSON.stringify(role.reasoningEffort));
-  if(role.sandboxMode)lines.push('sandbox_mode = '+JSON.stringify(role.sandboxMode));
-  lines.push('developer_instructions = '+JSON.stringify(role.instructions),'');
-  return lines.join('\n');
-}
-function writeAgentDefinitions(next,previous=config) {
-  const directory=path.join(next.workspace,'.codex','agents');
-  const active=next.roles.filter(role=>role.enabled);
-  const files=existsSync(directory)?readdirSync(directory).filter(name=>name.toLowerCase().endsWith('.toml')):[];
-  const writes=active.map(role=>{
-    const target=agentPath(next.workspace,role.name),existing=files.map(name=>path.join(directory,name)).find(file=>file.toLowerCase()===target.toLowerCase());
-    if(existing&&!readFileSync(existing,'utf8').includes(agentMarker))throw Error('ไม่สามารถเขียนทับไฟล์ agent ที่มีอยู่: '+existing);
-    const conflict=files.map(name=>path.join(directory,name)).find(file=>{
-      if(file.toLowerCase()===target.toLowerCase())return false;
-      const contents=readFileSync(file,'utf8');
-      return agentName(contents)===role.name&&!contents.includes(agentMarker);
-    });
-    if(conflict)throw Error('พบ custom agent ชื่อ '+role.name+' อยู่แล้วที่ '+conflict+' กรุณาเปลี่ยนชื่อ role ก่อนบันทึก');
-    return {target,contents:agentToml(role)};
-  });
-  if(writes.length)mkdirSync(directory,{recursive:true});
-  for(const file of writes){
-    const temp=file.target+'.acode-tmp';
-    writeFileSync(temp,file.contents,'utf8');renameSync(temp,file.target);
-  }
-  if(previous.workspace===next.workspace)for(const role of previous.roles||[]){
-    if(next.roles.some(item=>item.name===role.name&&item.enabled))continue;
-    const oldPath=agentPath(next.workspace,role.name);
-    if(existsSync(oldPath)&&readFileSync(oldPath,'utf8').includes(agentMarker))unlinkSync(oldPath);
-  }
 }
 function saveConfig(value) {
   const next=validateConfig(value);

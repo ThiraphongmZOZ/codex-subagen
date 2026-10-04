@@ -1,6 +1,10 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
+import {existsSync,mkdirSync,mkdtempSync,readFileSync,rmSync,writeFileSync} from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import {createState,ensureAgent,reduceEvent,compareThreadRecency,sumTokenUsage,estimateTokenCost} from './monitor.mjs';
+import {roleDefaults,writeAgentDefinitions} from './agent-config.mjs';
 test('real protocol events build a parent/child tree and maintain completed status',()=>{
  const s=createState();s.runs.push({id:'run',threadId:'root',status:'running'});
  ensureAgent(s,'root',{runId:'run',name:'Coordinator'});
@@ -49,4 +53,20 @@ test('API-equivalent token estimate uses custom cache and output rates and needs
  const usage={inputTokens:100,cachedInputTokens:20,cacheWriteInputTokens:10,outputTokens:40};
  assert.equal(estimateTokenCost(usage,{input:1,cachedInput:0.5,cacheWrite:2,output:3}),0.00022);
  assert.equal(estimateTokenCost(usage,{input:1,output:3}),null);
+});
+test('agent config smoke test pins planner to Sol, worker to Luna, and cleans only managed files on workspace change',()=>{
+ const base=mkdtempSync(path.join(os.tmpdir(),'acode-agent-smoke-')),oldWorkspace=path.join(base,'old'),newWorkspace=path.join(base,'new');
+ const roles=roleDefaults.filter(role=>['planner','worker'].includes(role.name)).map(role=>({...role,enabled:true}));
+ try{
+  writeAgentDefinitions({workspace:oldWorkspace,roles},{workspace:oldWorkspace,roles:[]});
+  const oldAgentDir=path.join(oldWorkspace,'.codex','agents');
+  writeFileSync(path.join(oldAgentDir,'my-custom-agent.toml'),'name = "my_custom_agent"\n','utf8');
+  writeAgentDefinitions({workspace:newWorkspace,roles},{workspace:oldWorkspace,roles});
+  const newAgentDir=path.join(newWorkspace,'.codex','agents');
+  assert.match(readFileSync(path.join(newAgentDir,'acode-planner.toml'),'utf8'),/model = "gpt-6\.1-sol"[\s\S]*model_reasoning_effort = "medium"[\s\S]*sandbox_mode = "read-only"/);
+  assert.match(readFileSync(path.join(newAgentDir,'acode-worker.toml'),'utf8'),/model = "gpt-6-luna"/);
+  assert.equal(existsSync(path.join(oldAgentDir,'acode-planner.toml')),false);
+  assert.equal(existsSync(path.join(oldAgentDir,'acode-worker.toml')),false);
+  assert.equal(existsSync(path.join(oldAgentDir,'my-custom-agent.toml')),true);
+ }finally{rmSync(base,{recursive:true,force:true});}
 });
