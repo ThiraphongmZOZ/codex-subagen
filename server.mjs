@@ -5,13 +5,13 @@ import {readFileSync,writeFileSync,mkdirSync,existsSync,statSync,renameSync} fro
 import {fileURLToPath} from 'node:url';
 import path from 'node:path';
 import {randomUUID,randomBytes} from 'node:crypto';
-import {createState,record,ensureAgent,reduceEvent,compareThreadRecency} from './monitor.mjs';
-import {roleDefaults,writeAgentDefinitions} from './agent-config.mjs';
+import {createState,record,ensureAgent,reduceEvent,reconcileThreadSnapshot,compareThreadRecency,activeDashboardRunCount,maxConcurrentRuns} from './monitor.mjs';
+import {roleDefaults,writeAgentDefinitions,recoverAgentDefinitions} from './agent-config.mjs';
 
 const root=path.dirname(fileURLToPath(import.meta.url));
 const port=Number(process.env.PORT||4310), origin=`http://127.0.0.1:${port}`;
 const dataDir=path.join(root,'data');mkdirSync(dataDir,{recursive:true});
-const configFile=path.join(dataDir,'config.json'), historyFile=path.join(dataDir,'history.json');
+const configFile=path.join(dataDir,'config.json'), historyFile=path.join(dataDir,'history.json'),agentTransactionFile=path.join(dataDir,'agent-transaction.json');
 const defaultCoordinatorInstructions='You are the coordinator and implementation owner. Start by assessing scope. Handle small, clear tasks directly or delegate one focused implementation task to worker; do not spawn agents just because slots are available. Use explorer for targeted read-only investigation when context is unclear. Escalate to planner only for uncertain root causes, cross-service/data-flow bugs, migrations, architecture, high-risk logic, repeated failed fixes, or several tightly related files. Give planner only concise relevant evidence, then return to worker for implementation. Use reviewer for ordinary changes and senior_reviewer only for high-risk work. Wait for every delegated result before proceeding or summarizing. Prefer Luna for exploration, implementation, and routine checks; use Sol for planning and high-risk review. Avoid sending the whole repository to Sol and avoid concurrent edits to the same files. Every subagent should start with a brief visible commentary line beginning with \"งาน: \".';
 const defaults={version:2,workspace:root,model:'gpt-6-luna',reasoningEffort:'medium',maxAgents:5,maxSolAgents:2,solTokenWarning:50000,workflowPreset:'custom',tokenRates:{},approvalPolicy:'on-request',sandboxMode:'workspace-write',coordinatorInstructions:defaultCoordinatorInstructions,roles:roleDefaults};
 const legacyInstructions={explorer:'Inspect the project and gather evidence. Return concise findings.',worker:'Implement the assigned change and verify it.',reviewer:'Review correctness and risks. Return actionable findings.'};
@@ -29,6 +29,7 @@ function normalizeConfig(value) {
   return {...defaults,...value,version:2,coordinatorInstructions:value.coordinatorInstructions||defaultCoordinatorInstructions,roles};
 }
 let config=normalizeConfig(existsSync(configFile)?JSON.parse(readFileSync(configFile,'utf8')):defaults);
+recoverAgentDefinitions(agentTransactionFile);
 const state=createState(), clients=new Set(), pending=new Map(), token=randomBytes(24).toString('hex');
 let codexThreads=[],historyBusy=false,historyTask=Promise.resolve();
 if(existsSync(historyFile)) {
@@ -60,6 +61,7 @@ function disconnected(message) {
   state.approvals=[];
   for(const a of Object.values(state.agents)) if(['running','waiting','queued'].includes(a.status)) a.status='unknown';
   for(const r of state.runs) if(['running','starting'].includes(r.status)) r.status='unknown';
+  hydrated.clear();
   publish();
 }
 function onMessage(msg) {
@@ -108,9 +110,28 @@ async function connect() {
       a.model=thread.model||null;
       a.reasoningEffort=thread.reasoningEffort||a.reasoningEffort||null;
       a.name=thread.agentNickname||thread.agentRole||a.name;
-    }));publish();
+    }));
+    await reconcileDashboardRuns();publish();
   })().catch(e=>{state.error=e.message;publish();readyPromise=null;throw e;});
   return readyPromise;
+}
+let reconcilingRuns=false;
+async function reconcileDashboardRuns(){
+  if(reconcilingRuns||!state.connected)return;
+  reconcilingRuns=true;
+  let changed=false;
+  try{
+    const runs=state.runs.filter(run=>!run.external&&run.threadId&&['starting','running','unknown'].includes(run.status));
+    const runIds=new Set(runs.map(run=>run.id));
+    const agents=Object.values(state.agents).filter(agent=>runIds.has(agent.runId));
+    await Promise.allSettled(agents.map(async agent=>{
+      const observedAt=agent.updatedAt;
+      const before=JSON.stringify(agent);
+      const {thread}=await rpc('thread/read',{threadId:agent.id,includeTurns:true});
+      if(state.agents[agent.id]?.updatedAt===observedAt){reconcileThreadSnapshot(state,thread);if(before!==JSON.stringify(agent))changed=true;}
+    }));
+    return changed;
+  }finally{reconcilingRuns=false;}
 }
 async function refreshModels() {
   const models=[];let cursor=null;
@@ -200,18 +221,15 @@ function validateConfig(value) {
 }
 function saveConfig(value) {
   const next=validateConfig(value);
-  writeAgentDefinitions(next,config);
+  writeAgentDefinitions(next,config,{transactionFile:agentTransactionFile});
   const temp=configFile+'.tmp';writeFileSync(temp,JSON.stringify(next,null,2));renameSync(temp,configFile);
   config=next;publish();
 }
-function hasActiveDashboardWork() {
-  const externalRunIds=new Set(state.runs.filter(run=>run.external).map(run=>run.id));
-  return state.runs.some(run=>!run.external&&['starting','running'].includes(run.status))||Object.values(state.agents).some(agent=>!externalRunIds.has(agent.runId)&&['running','waiting','queued'].includes(agent.status));
-}
 async function startRun(input) {
-  if(starting||hasActiveDashboardWork()) throw Error('A run is already active. Stop it or wait for completion.');
+  if(starting)throw Error('Another start or resume request is being prepared. Try again in a moment.');
+  if(activeDashboardRunCount(state.runs)>=maxConcurrentRuns)throw Error('Dashboard supports up to '+maxConcurrentRuns+' active runs at once. Wait for one to finish.');
   if(typeof input.prompt!=='string'||!input.prompt.trim()||input.prompt.length>20000) throw Error('Enter a task (up to 20,000 characters)');
-  const cfg=validateConfig(config);writeAgentDefinitions(cfg,cfg);starting=true;
+  const cfg=validateConfig(config);writeAgentDefinitions(cfg,cfg,{transactionFile:agentTransactionFile});starting=true;
   const run={id:randomUUID(),prompt:input.prompt.trim(),status:'starting',startedAt:new Date().toISOString(),threadId:null,workspace:cfg.workspace,workflowPreset:cfg.workflowPreset};
   try {
     await connect();if(!state.account) throw Error('Sign in to Codex first: run codex login in your terminal');
@@ -277,7 +295,7 @@ async function continueRun(input) {
   const a=state.agents[run.threadId];if(!a) throw Error('Coordinator thread was not found');
   const external=!!run.external;
   const targetActive=external&&(['running','waiting'].includes(run.status)||['running','waiting'].includes(a.status));
-  if(starting||hasActiveDashboardWork()) throw Error('A run is already active. Wait for completion or stop it first.');
+  if(starting)throw Error('Another start or resume request is being prepared. Try again in a moment.');
   if(!['completed','error','interrupted','unknown'].includes(run.status)&&!targetActive) throw Error('This conversation is not ready for a follow-up');
   if(input.fork)return forkAndContinue(run,input.prompt.trim());
   const previousStatus=run.status,previousLastInput=run.lastInput;starting=true;run.status='starting';run.lastInput=input.prompt.trim();publish();
@@ -365,6 +383,7 @@ const server=http.createServer(async(req,res)=>{
   }catch(e){json({error:e.message},400);}
 });
 server.listen(port,'127.0.0.1',()=>{console.log('Acode dashboard: '+origin);connect().then(()=>syncCodexHistory(true)).catch(()=>{});});
+setInterval(()=>{if(state.connected)reconcileDashboardRuns().then(changed=>{if(changed)publish();}).catch(()=>{});},5000).unref();
 setInterval(()=>{if(state.connected&&!historyBusy)syncCodexHistory(false).catch(()=>{});},30000).unref();
 server.on('error',e=>{console.error(e.message);proc?.kill();process.exitCode=1;});
 function shutdown(){clearTimeout(saveTimer);try{persist();}catch{}proc?.kill();for(const c of clients)c.end();server.close(()=>process.exit());setTimeout(()=>process.exit(),2000).unref();}

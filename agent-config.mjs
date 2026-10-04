@@ -13,6 +13,20 @@ const agentMarker='# Managed by Acode Agent Control.';
 const agentPath=(workspace,name)=>path.join(workspace,'.codex','agents','acode-'+name+'.toml');
 const samePath=(a,b)=>{const left=path.resolve(a),right=path.resolve(b);return process.platform==='win32'?left.toLowerCase()===right.toLowerCase():left===right;};
 function agentName(contents){return contents.match(/^name\s*=\s*["']([^"']+)["']/m)?.[1]||'';}
+export function recoverAgentDefinitions(journalFile) {
+  if(!existsSync(journalFile))return false;
+  const transaction=JSON.parse(readFileSync(journalFile,'utf8'));
+  for(const file of [...(transaction.writes||[])].reverse()){
+    if(file.original===null){if(existsSync(file.target))unlinkSync(file.target);}
+    else{const temp=file.target+'.acode-recovery-'+randomUUID();writeFileSync(temp,file.original,'utf8');renameSync(temp,file.target);}
+    if(file.temp&&existsSync(file.temp))unlinkSync(file.temp);
+  }
+  for(const file of transaction.removals||[]){
+    if(!existsSync(file.target)){const temp=file.target+'.acode-recovery-'+randomUUID();mkdirSync(path.dirname(file.target),{recursive:true});writeFileSync(temp,file.contents,'utf8');renameSync(temp,file.target);}
+  }
+  unlinkSync(journalFile);
+  return true;
+}
 function agentToml(role) {
   const lines=[agentMarker,'name = '+JSON.stringify(role.name),'description = '+JSON.stringify(role.description)];
   if(role.model)lines.push('model = '+JSON.stringify(role.model));
@@ -23,6 +37,8 @@ function agentToml(role) {
 }
 export function writeAgentDefinitions(next,previous={workspace:next.workspace,roles:[]},operations={}) {
   const io={writeFileSync,renameSync,unlinkSync,...operations};
+  const journalFile=operations.transactionFile||path.join(next.workspace,'.codex','agents','.acode-agent-transaction.json');
+  recoverAgentDefinitions(journalFile);
   const directory=path.join(next.workspace,'.codex','agents');
   const active=next.roles.filter(role=>role.enabled);
   const files=existsSync(directory)?readdirSync(directory).filter(name=>name.toLowerCase().endsWith('.toml')):[];
@@ -47,10 +63,17 @@ export function writeAgentDefinitions(next,previous={workspace:next.workspace,ro
     if(existsSync(target)){const contents=readFileSync(target,'utf8');if(contents.includes(agentMarker))removals.push({target,contents,removed:false});}
   }
   if(writes.length)mkdirSync(directory,{recursive:true});
+  if(writes.length||removals.length)mkdirSync(path.dirname(journalFile),{recursive:true});
+  const journalTemp=journalFile+'.tmp-'+randomUUID();
   try{
     for(const file of writes)io.writeFileSync(file.temp,file.contents,'utf8');
+    if(writes.length||removals.length){
+      io.writeFileSync(journalTemp,JSON.stringify({writes:writes.map(file=>({target:file.target,original:file.existingContents,temp:file.temp})),removals:removals.map(file=>({target:file.target,contents:file.contents}))}),'utf8');
+      io.renameSync(journalTemp,journalFile);
+    }
     for(const file of writes){io.renameSync(file.temp,file.target);file.committed=true;}
     for(const file of removals){io.unlinkSync(file.target);file.removed=true;}
+    if(existsSync(journalFile))io.unlinkSync(journalFile);
   }catch(error){
     const rollbackErrors=[];
     for(const file of removals.filter(item=>item.removed).reverse())try{
@@ -61,6 +84,8 @@ export function writeAgentDefinitions(next,previous={workspace:next.workspace,ro
       else if(existsSync(file.target))io.unlinkSync(file.target);
     }catch(rollbackError){rollbackErrors.push(rollbackError.message);}
     for(const file of writes)if(existsSync(file.temp))try{io.unlinkSync(file.temp);}catch(rollbackError){rollbackErrors.push(rollbackError.message);}
+    if(existsSync(journalTemp))try{io.unlinkSync(journalTemp);}catch(rollbackError){rollbackErrors.push(rollbackError.message);}
+    if(!rollbackErrors.length&&existsSync(journalFile))try{io.unlinkSync(journalFile);}catch(rollbackError){rollbackErrors.push(rollbackError.message);}
     const suffix=rollbackErrors.length?'; rollback incomplete: '+rollbackErrors.join('; '):'; managed agent files were rolled back';
     throw Error('Could not update managed agent files: '+error.message+suffix);
   }

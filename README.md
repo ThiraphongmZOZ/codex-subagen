@@ -36,8 +36,12 @@ npm start
 - Server ผูกกับ 127.0.0.1 ตรวจ Host/Origin และ token ของคำขอแก้ไข ไม่ควรเปิดผ่าน proxy สาธารณะโดยไม่มี authentication เพิ่มเติม
 
 ```powershell
+npm install
+npx playwright install chromium
 npm test
 ```
+
+`npm test` runs reducer and config recovery checks plus a Playwright smoke test for Workflow and Config. Screenshots are saved under ignored `work/`.
 
 เอกสารอ้างอิง: https://learn.chatgpt.com/docs/app-server และ https://learn.chatgpt.com/docs/agent-configuration/subagents
 

@@ -1,10 +1,12 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
+import {spawnSync} from 'node:child_process';
 import {existsSync,mkdirSync,mkdtempSync,readFileSync,readdirSync,renameSync,rmSync,unlinkSync,writeFileSync} from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import {createState,ensureAgent,reduceEvent,compareThreadRecency,sumTokenUsage,estimateTokenCost,solTokenUsage,solTokenWarningExceeded,delegationReason,delegationReasonLabel,agentsForRun} from './monitor.mjs';
-import {roleDefaults,writeAgentDefinitions} from './agent-config.mjs';
+import {fileURLToPath} from 'node:url';
+import {createState,ensureAgent,reduceEvent,reconcileThreadSnapshot,compareThreadRecency,sumTokenUsage,estimateTokenCost,solTokenUsage,solTokenWarningExceeded,delegationReason,delegationReasonLabel,agentsForRun,activeDashboardRunCount,maxConcurrentRuns} from './monitor.mjs';
+import {roleDefaults,writeAgentDefinitions,recoverAgentDefinitions} from './agent-config.mjs';
 test('real protocol events build a parent/child tree and maintain completed status',()=>{
  const s=createState();s.runs.push({id:'run',threadId:'root',status:'running'});
  ensureAgent(s,'root',{runId:'run',name:'Coordinator'});
@@ -64,6 +66,48 @@ test('agent selection and token totals stay scoped to one run',()=>{
  assert.equal(sumTokenUsage(agentsForRun(agents,'one')).totalTokens,15);
  assert.deepEqual(agentsForRun(agents,'one').map(a=>a.id),['a','b']);
 });
+test('five interleaved runs keep reasons, tokens, and parent trees isolated',()=>{
+ const s=createState(),expected=[];
+ for(let i=0;i<5;i++){
+  const runId='run-'+i,root='root-'+i,child='child-'+i;s.runs.push({id:runId,threadId:root,status:'running',workflowPreset:i%2?'balanced':'safe'});
+  ensureAgent(s,root,{runId,name:'Coordinator'});reduceEvent(s,'item/completed',{threadId:root,item:{type:'collabAgentToolCall',tool:'spawnAgent',receiverThreadIds:[child],prompt:'Reason: issue-'+i+'\nInspect component'}});
+  reduceEvent(s,'thread/tokenUsage/updated',{threadId:child,tokenUsage:{total:{totalTokens:100+i,inputTokens:80+i,outputTokens:20}}});
+  reduceEvent(s,'thread/started',{thread:{id:child,parentThreadId:root,model:i%2?'gpt-6.1-sol':'gpt-6-luna',agentNickname:'Reviewer'}});
+  expected.push({runId,root,child,token:100+i,reason:'issue-'+i});
+ }
+ for(const row of expected){
+  const scoped=agentsForRun(Object.values(s.agents),row.runId);
+  assert.deepEqual(scoped.map(a=>a.id).sort(),[row.child,row.root].sort());
+  assert.equal(s.agents[row.child].parentId,row.root);assert.equal(s.agents[row.child].escalationReason,row.reason);
+  assert.equal(sumTokenUsage(scoped).totalTokens,row.token);
+ }
+ assert.equal(activeDashboardRunCount(s.runs),5);assert.equal(maxConcurrentRuns,5);
+});
+test('restart reconciliation restores live thread status and stale event order cannot regress it',()=>{
+ const s=createState();s.runs.push({id:'run',threadId:'root',status:'unknown',workflowPreset:'balanced'});
+ ensureAgent(s,'root',{runId:'run',status:'unknown',tokenUsage:{total:{totalTokens:200}}});
+ ensureAgent(s,'child',{runId:'run',parentId:'root',status:'unknown'});
+ const restored=reconcileThreadSnapshot(s,{id:'root',status:{type:'active',activeFlags:[]},model:'gpt-6-luna',turns:[{id:'turn-2',status:'inProgress',items:[]}]});
+ assert.equal(restored.status,'running');assert.equal(restored.turnId,'turn-2');assert.equal(s.runs[0].status,'running');
+ reconcileThreadSnapshot(s,{id:'child',parentThreadId:'root',status:{type:'idle'},model:'gpt-6.1-sol',turns:[{id:'child-turn',status:'completed',items:[{type:'agentMessage',text:'Recovered result'}]}]});
+ assert.equal(s.agents.child.parentId,'root');assert.equal(s.agents.child.output,'Recovered result');
+ reduceEvent(s,'turn/completed',{threadId:'root',turn:{id:'turn-2',status:'completed'}});
+ reduceEvent(s,'turn/started',{threadId:'root',turn:{id:'turn-2'}});
+ assert.equal(s.agents.root.status,'completed');assert.equal(s.runs[0].status,'completed');
+ reduceEvent(s,'thread/tokenUsage/updated',{threadId:'root',tokenUsage:{total:{totalTokens:100}}});
+ assert.equal(s.agents.root.tokenUsage.total.totalTokens,200);
+});
+test('child and terminal turn events arriving before their metadata reconcile safely',()=>{
+ const s=createState();
+ reduceEvent(s,'thread/tokenUsage/updated',{threadId:'child',tokenUsage:{total:{totalTokens:24,outputTokens:4}}});
+ reduceEvent(s,'thread/started',{thread:{id:'child',parentThreadId:'root',model:'gpt-6-luna'}});
+ ensureAgent(s,'root',{runId:'run'});
+ assert.equal(s.agents.child.parentId,'root');assert.equal(s.agents.child.runId,'run');assert.equal(s.agents.child.tokenUsage.total.totalTokens,24);
+ const other=createState();ensureAgent(other,'thread',{runId:'run'});
+ reduceEvent(other,'turn/completed',{threadId:'thread',turn:{id:'turn-1',status:'completed'}});
+ reduceEvent(other,'turn/started',{threadId:'thread',turn:{id:'turn-1'}});
+ assert.equal(other.agents.thread.status,'completed');assert.equal(other.agents.thread.turnId,'turn-1');
+});
 test('Sol token warning counts only Sol-model agents and accepts a disabled threshold',()=>{
  const agents=[{model:'gpt-6-luna',tokenUsage:{total:{totalTokens:900}}},{model:'gpt-6.1-sol',tokenUsage:{total:{totalTokens:2000}}}];
  assert.equal(solTokenUsage(agents),2000);assert.equal(solTokenWarningExceeded(agents,2000),false);assert.equal(solTokenWarningExceeded(agents,1999),true);assert.equal(solTokenWarningExceeded(agents,0),false);
@@ -118,5 +162,21 @@ test('agent config update rolls back prior managed files when a later rename fai
   }),/rolled back/);
   assert.equal(readFileSync(explorer,'utf8'),beforeExplorer);assert.equal(readFileSync(planner,'utf8'),beforePlanner);
   assert.deepEqual(readdirSync(path.dirname(explorer)).filter(name=>name.includes('acode-tmp-')||name.includes('acode-rollback-')),[]);
+ }finally{rmSync(workspace,{recursive:true,force:true});}
+});
+test('agent config journal recovers files after the process exits mid-commit',()=>{
+ const workspace=mkdtempSync(path.join(os.tmpdir(),'acode-agent-crash-')),journal=path.join(workspace,'data','agent-transaction.json');
+ try{
+  const roles=roleDefaults.filter(role=>['explorer','planner'].includes(role.name)).map(role=>({...role,enabled:true}));
+  writeAgentDefinitions({workspace,roles},{workspace,roles:[]},{transactionFile:journal});
+  const explorer=path.join(workspace,'.codex','agents','acode-explorer.toml'),planner=path.join(workspace,'.codex','agents','acode-planner.toml');
+  const beforeExplorer=readFileSync(explorer,'utf8'),beforePlanner=readFileSync(planner,'utf8'),nextRoles=roles.map(role=>({...role,description:'Updated '+role.name}));
+  const script=`import {writeAgentDefinitions} from './agent-config.mjs'; import {renameSync,writeFileSync,unlinkSync} from 'node:fs'; const [workspace,journal,planner]=process.argv.slice(1); const roles=${JSON.stringify(nextRoles)}; writeAgentDefinitions({workspace,roles},{workspace,roles:${JSON.stringify(roles)}},{transactionFile:journal,renameSync(from,to){if(to===planner)process.exit(23);return renameSync(from,to);},writeFileSync,unlinkSync});`;
+  const crashed=spawnSync(process.execPath,['--input-type=module','-e',script,workspace,journal,planner],{cwd:path.dirname(fileURLToPath(import.meta.url)),encoding:'utf8'});
+  assert.equal(crashed.status,23,crashed.stderr||crashed.error?.message);
+  assert.equal(existsSync(journal),true);
+  assert.equal(recoverAgentDefinitions(journal),true);
+  assert.equal(readFileSync(explorer,'utf8'),beforeExplorer);assert.equal(readFileSync(planner,'utf8'),beforePlanner);
+  assert.equal(existsSync(journal),false);
  }finally{rmSync(workspace,{recursive:true,force:true});}
 });
