@@ -13,7 +13,7 @@ const port=Number(process.env.PORT||4310), origin=`http://127.0.0.1:${port}`;
 const dataDir=path.join(root,'data');mkdirSync(dataDir,{recursive:true});
 const configFile=path.join(dataDir,'config.json'), historyFile=path.join(dataDir,'history.json');
 const defaultCoordinatorInstructions='You are the coordinator and implementation owner. Start by assessing scope. Handle small, clear tasks directly or delegate one focused implementation task to worker; do not spawn agents just because slots are available. Use explorer for targeted read-only investigation when context is unclear. Escalate to planner only for uncertain root causes, cross-service/data-flow bugs, migrations, architecture, high-risk logic, repeated failed fixes, or several tightly related files. Give planner only concise relevant evidence, then return to worker for implementation. Use reviewer for ordinary changes and senior_reviewer only for high-risk work. Wait for every delegated result before proceeding or summarizing. Prefer Luna for exploration, implementation, and routine checks; use Sol for planning and high-risk review. Avoid sending the whole repository to Sol and avoid concurrent edits to the same files. Every subagent should start with a brief visible commentary line beginning with \"งาน: \".';
-const defaults={version:2,workspace:root,model:'gpt-6-luna',reasoningEffort:'medium',maxAgents:5,maxSolAgents:2,tokenRates:{},approvalPolicy:'on-request',sandboxMode:'workspace-write',coordinatorInstructions:defaultCoordinatorInstructions,roles:roleDefaults};
+const defaults={version:2,workspace:root,model:'gpt-6-luna',reasoningEffort:'medium',maxAgents:5,maxSolAgents:2,solTokenWarning:50000,tokenRates:{},approvalPolicy:'on-request',sandboxMode:'workspace-write',coordinatorInstructions:defaultCoordinatorInstructions,roles:roleDefaults};
 const legacyInstructions={explorer:'Inspect the project and gather evidence. Return concise findings.',worker:'Implement the assigned change and verify it.',reviewer:'Review correctness and risks. Return actionable findings.'};
 function normalizeConfig(value) {
   if(!value||typeof value!=='object')return defaults;
@@ -167,6 +167,8 @@ function validateConfig(value) {
   if(!Number.isInteger(value.maxAgents)||value.maxAgents<1||value.maxAgents>8)throw Error('Max agents must be between 1 and 8');
   const maxSolAgents=value.maxSolAgents??defaults.maxSolAgents;
   if(!Number.isInteger(maxSolAgents)||maxSolAgents<0||maxSolAgents>8)throw Error('Max Sol agents must be between 0 and 8');
+  const solTokenWarning=value.solTokenWarning??defaults.solTokenWarning;
+  if(!Number.isInteger(solTokenWarning)||solTokenWarning<0||solTokenWarning>10_000_000)throw Error('Sol token warning must be between 0 and 10,000,000');
   const tokenRates=value.tokenRates??{};
   if(!tokenRates||typeof tokenRates!=='object'||Array.isArray(tokenRates)||Object.keys(tokenRates).length>100)throw Error('Invalid token price table');
   for(const [model,rates] of Object.entries(tokenRates)){
@@ -192,7 +194,7 @@ function validateConfig(value) {
     return {name:role.name,description:role.description,model:role.model,reasoningEffort:role.reasoningEffort,sandboxMode:role.sandboxMode,enabled:role.enabled,instructions:role.instructions};
   });
   if(new Set(roles.map(r=>r.name)).size!==roles.length)throw Error('Role names must be unique');
-  return {version:2,workspace:path.resolve(value.workspace),model:value.model,reasoningEffort,maxAgents:value.maxAgents,maxSolAgents,tokenRates,approvalPolicy,sandboxMode,coordinatorInstructions:value.coordinatorInstructions,roles};
+  return {version:2,workspace:path.resolve(value.workspace),model:value.model,reasoningEffort,maxAgents:value.maxAgents,maxSolAgents,solTokenWarning,tokenRates,approvalPolicy,sandboxMode,coordinatorInstructions:value.coordinatorInstructions,roles};
 }
 function saveConfig(value) {
   const next=validateConfig(value);
@@ -212,7 +214,7 @@ async function startRun(input) {
   try {
     await connect();if(!state.account) throw Error('Sign in to Codex first: run codex login in your terminal');
     const roles=cfg.roles.filter(role=>role.enabled);
-    const instructions=cfg.coordinatorInstructions+'\n\nConfigured custom agent roles (delegate using these exact names only):\n'+roles.map(role=>'- '+role.name+' ('+role.model+', '+(role.reasoningEffort||'model default')+'): '+role.description).join('\n')+'\n\nDo not create more than '+cfg.maxAgents+' subagents at once. Use no more than '+cfg.maxSolAgents+' Sol-model subagents across this run, including sequential replacements; once the limit is reached, use a Luna role or do the task yourself. This Sol limit is a coordinator instruction, not an enforced server-side gate. Wait for delegated results before dependent work or the final summary. If no role matches, handle the task yourself.';
+    const instructions=cfg.coordinatorInstructions+'\n\nConfigured custom agent roles (delegate using these exact names only):\n'+roles.map(role=>'- '+role.name+' ('+role.model+', '+(role.reasoningEffort||'model default')+'): '+role.description).join('\n')+'\n\nDo not create more than '+cfg.maxAgents+' subagents at once. Use no more than '+cfg.maxSolAgents+' Sol-model subagents across this run, including sequential replacements; once the limit is reached, use a Luna role or do the task yourself. This Sol limit is a coordinator instruction, not an enforced server-side gate. Whenever delegating to a Sol role, start its delegation prompt with "Reason: <short, concrete escalation reason>". Wait for delegated results before dependent work or the final summary. If no role matches, handle the task yourself.';
     const chosenModel=cfg.model||(state.models.find(m=>m.isDefault)?.model);
     if(!chosenModel) throw Error('No available default model. Choose a model in Configuration.');
     const params={model:chosenModel,cwd:cfg.workspace,approvalPolicy:cfg.approvalPolicy,sandbox:cfg.sandboxMode,developerInstructions:instructions,config:{'agents.enabled':roles.length>0,'agents.max_concurrent_threads_per_session':cfg.maxAgents,'agents.default_subagent_model':chosenModel}};

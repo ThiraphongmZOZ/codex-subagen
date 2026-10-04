@@ -1,4 +1,4 @@
-import {sumTokenUsage,estimateTokenCost} from './monitor.mjs';
+import {sumTokenUsage,estimateTokenCost,solTokenUsage,solTokenWarningExceeded} from './monitor.mjs';
 const $=id=>document.getElementById(id);
 let state,token,selectedRun='',filter='all',busy=false,source,refreshAfterReconnect=false,view=location.hash==='#workflow'?'workflow':location.hash==='#history'?'history':'monitor',flowAgent='',flowSignature='',flowScale=1,flowSize={width:800,height:500};
 const labels={running:'กำลังทำงาน',queued:'รอเริ่ม',waiting:'รออนุมัติ',completed:'เสร็จแล้ว',interrupted:'หยุดแล้ว',error:'ผิดพลาด',unknown:'ไม่ทราบสถานะ',closed:'ปิดแล้ว',idle:'ว่าง'};
@@ -10,7 +10,8 @@ function toast(message,error=false){$('toast').textContent=message;$('toast').cl
 async function post(route,body={}) {const res=await fetch('/api/'+route,{method:'POST',headers:{'Content-Type':'application/json','X-Acode-Token':token},body:JSON.stringify(body)});const result=await res.json();if(!res.ok)throw Error(result.error);return result;}
 function selectedAgents(){return Object.values(state.agents).filter(a=>a.runId===selectedRun);}
 const tokenFormat=value=>Number(value||0).toLocaleString('en-US');
-function agentCost(agent){return estimateTokenCost(agent.tokenUsage?.total,state.config.tokenRates?.[agentModel(agent,state.runs.find(r=>r.id===agent.runId))]);}
+function effectiveAgentModel(agent,run){const roleName=agent.name?.split('/').filter(Boolean).at(-1),role=state.config.roles.find(r=>r.name===roleName);return agent.model||role?.model||(!agent.parentId?run?.model:'')||'';}
+function agentCost(agent){const run=state.runs.find(r=>r.id===agent.runId);return estimateTokenCost(agent.tokenUsage?.total,state.config.tokenRates?.[effectiveAgentModel(agent,run)]);}
 function costLabel(value){return value===null?'API estimate: ตั้งราคาใน config':'API estimate: $'+value.toFixed(8);}
 function agentUsage(agent){
   const u=agent.tokenUsage?.total;if(!u)return '';
@@ -24,9 +25,15 @@ function usageTotals(agents){
 }
 function solSubagentCount(agents){
   return agents.filter(a=>a.parentId).filter(a=>{
-    const roleName=a.name?.split('/').filter(Boolean).at(-1),role=state.config.roles.find(r=>r.name===roleName);
-    return (a.model||role?.model||'').toLowerCase().includes('sol');
+    return effectiveAgentModel(a,state.runs.find(r=>r.id===a.runId)).toLowerCase().includes('sol');
   }).length;
+}
+function renderRunAnalytics(agents,run){
+  const used=agents.filter(a=>a.tokenUsage?.total);if(!used.length){$('flow-analytics').innerHTML='<p class="muted">จะแสดงสรุปการใช้ token ต่อ role เมื่อ Codex ส่งข้อมูล usage มา</p>';return;}
+  const total=sumTokenUsage(agents),solTokens=solTokenUsage(agents.map(a=>({...a,model:effectiveAgentModel(a,run)}))),limit=state.config.solTokenWarning??50000,warning=solTokenWarningExceeded(agents.map(a=>({...a,model:effectiveAgentModel(a,run)})),limit),costs=used.map(agentCost),allCostsKnown=costs.every(value=>value!==null),totalCost=allCostsKnown?costs.reduce((sum,value)=>sum+value,0):null,solUsed=used.filter(a=>effectiveAgentModel(a,run).toLowerCase().includes('sol')),solCosts=solUsed.map(agentCost),solCost=solCosts.every(value=>value!==null)?solCosts.reduce((sum,value)=>sum+value,0):null;
+  const rows=used.map(a=>'<tr><td>'+escape(a.name?.split('/').filter(Boolean).at(-1)||'Agent')+'</td><td>'+escape(effectiveAgentModel(a,run)||'ไม่ทราบ')+'</td><td>'+tokenFormat(a.tokenUsage.total.totalTokens)+'</td><td>'+(agentCost(a)===null?'—':('$'+agentCost(a).toFixed(8)))+'</td></tr>').join('');
+  const tokenShare=total.totalTokens?((solTokens/total.totalTokens)*100).toFixed(1)+'%':'—',costShare=totalCost!==null&&totalCost>0&&solCost!==null?((solCost/totalCost)*100).toFixed(1)+'%':'—';
+  $('flow-analytics').innerHTML='<div class="analytics-stats"><div><span>Token รวม</span><strong>'+tokenFormat(total.totalTokens)+'</strong></div><div><span>Sol tokens</span><strong>'+tokenFormat(solTokens)+' / '+(limit?tokenFormat(limit):'ไม่มีแจ้งเตือน')+'</strong></div><div><span>สัดส่วน Sol</span><strong>'+tokenShare+' tokens · '+costShare+' cost</strong></div><div><span>ค่าเทียบ API รวม</span><strong>'+(totalCost===null?'ตั้งราคาใน Config':'$'+totalCost.toFixed(8))+'</strong></div></div>'+(warning?'<p class="budget-warning" role="alert">⚠ Sol token usage เกินเกณฑ์แจ้งเตือน '+tokenFormat(limit)+' tokens แล้ว · งานยังทำต่อได้</p>':'')+(rows?'<table class="analytics-table"><thead><tr><th>Role</th><th>Model</th><th>Tokens</th><th>API estimate</th></tr></thead><tbody>'+rows+'</tbody></table>':'<p class="muted">จะแสดงยอดเมื่อ Codex ส่ง token usage ของ agent มา</p>');
 }
 function render(){
   if(!state)return;
@@ -57,7 +64,7 @@ function render(){
   visit(null);for(const a of agents)if(!ordered.some(x=>x.a.id===a.id))ordered.push({a,depth:0});
   const visible=ordered.filter(({a})=>filter==='all'||(filter==='working'?['running','waiting','queued'].includes(a.status):a.status==='completed'));
   const openIds=new Set([...$('agents').querySelectorAll('details[open]')].map(d=>d.dataset.id));
-  if(agents.length){$('agents').innerHTML=visible.length?visible.map(({a,depth})=>`<article class="agent-card ${depth?'child':''}"><div class="agent-top"><div class="avatar">${depth?'↳':'◈'}</div><div><div class="agent-name">${escape(a.name)}</div><div class="agent-id">${depth?'SUBAGENT':'COORDINATOR'} · ${escape(a.id.slice(0,8))}</div></div><span class="badge ${escape(a.status)}">${escape(labels[a.status]||a.status)}</span></div><div class="agent-task">${escape(a.task||'Codex ยังไม่ส่งรายละเอียดงาน — ดูกิจกรรมและผลลัพธ์ด้านล่าง')}</div><div class="agent-activity">${escape(a.activity||'รอเหตุการณ์จาก Codex')} · ${time(a.updatedAt)}</div>${agentUsage(a)}${a.plan?.length?'<ul class="agent-plan">'+a.plan.map(p=>`<li>${escape(p.step)} · ${escape(p.status)}</li>`).join('')+'</ul>':''}${a.output?`<details data-id="${escape(a.id)}" ${openIds.has(a.id)?'open':''}><summary>ดูผลลัพธ์</summary><pre>${escape(a.output)}</pre></details>`:''}</article>`).join(''):'<div class="empty-small">ไม่มี agent ในสถานะนี้</div>';}
+  if(agents.length){$('agents').innerHTML=visible.length?visible.map(({a,depth})=>`<article class="agent-card ${depth?'child':''}"><div class="agent-top"><div class="avatar">${depth?'↳':'◈'}</div><div><div class="agent-name">${escape(a.name)}</div><div class="agent-id">${depth?'SUBAGENT':'COORDINATOR'} · ${escape(a.id.slice(0,8))}</div></div><span class="badge ${escape(a.status)}">${escape(labels[a.status]||a.status)}</span></div><div class="agent-task">${escape(a.task||'Codex ยังไม่ส่งรายละเอียดงาน — ดูกิจกรรมและผลลัพธ์ด้านล่าง')}</div><div class="agent-activity">${escape(a.activity||'รอเหตุการณ์จาก Codex')} · ${time(a.updatedAt)}</div>${a.escalationReason?'<div class="agent-reason">เหตุผลที่เรียก agent: '+escape(a.escalationReason)+'</div>':''}${agentUsage(a)}${a.plan?.length?'<ul class="agent-plan">'+a.plan.map(p=>`<li>${escape(p.step)} · ${escape(p.status)}</li>`).join('')+'</ul>':''}${a.output?`<details data-id="${escape(a.id)}" ${openIds.has(a.id)?'open':''}><summary>ดูผลลัพธ์</summary><pre>${escape(a.output)}</pre></details>`:''}</article>`).join(''):'<div class="empty-small">ไม่มี agent ในสถานะนี้</div>';}
   const run=state.runs.find(r=>r.id===selectedRun);$('run-actions').hidden=!run;$('stop').hidden=!run||(!['starting','running'].includes(run.status)&&!working.length);$('run-status').textContent=run?'สถานะงาน: '+(labels[run.status]||run.status):'';
   const ids=new Set(agents.map(a=>a.id));const events=state.events.filter(e=>(!e.threadId||ids.has(e.threadId))&&eventLabels[e.method]);
   $('activity').innerHTML=events.length?events.slice(0,60).map(e=>{const detail=String(e.detail??'');return `<div class="activity-item"><time>${time(e.time)}</time><b>${escape(eventLabels[e.method])} · ${escape(state.agents[e.threadId]?.name||'ระบบ')}</b><p>${escape(detailLabels[detail]||detail.slice(0,230))}</p></div>`;}).join(''):'<div class="empty-small">ยังไม่มีกิจกรรม</div>';
@@ -110,6 +117,19 @@ function addRole(role={name:'',description:'Custom agent for one focused task',m
   div.querySelector('.remove-role').onclick=()=>{div.remove();renderTokenRates();};$('roles').append(div);
 }
 function readRole(row){return {name:row.querySelector('[data-role-field="name"]').value,description:row.querySelector('[data-role-field="description"]').value,model:row.querySelector('[data-role-field="model"]').value,reasoningEffort:row.querySelector('[data-role-field="reasoningEffort"]').value,sandboxMode:row.querySelector('[data-role-field="sandboxMode"]').value,enabled:row.querySelector('[data-role-field="enabled"]').checked,instructions:row.querySelector('[data-role-field="instructions"]').value};}
+const presetRoles={explorer:{model:'gpt-6-luna',effort:'',sandbox:'read-only'},planner:{model:'gpt-6.1-sol',effort:'medium',sandbox:'read-only'},worker:{model:'gpt-6-luna',effort:'medium',sandbox:''},reviewer:{model:'gpt-6-luna',effort:'medium',sandbox:'read-only'},senior_reviewer:{model:'gpt-6.1-sol',effort:'high',sandbox:'read-only'}};
+function applyWorkflowPreset(name){
+  if(name==='custom')return;
+  modelOptions('gpt-6-luna','medium');
+  const enabled=name==='fast'?new Set():name==='balanced'?new Set(['explorer','planner','worker','reviewer']):new Set(Object.keys(presetRoles));
+  for(const row of $('roles').children){
+    const role=row.querySelector('[data-role-field="name"]').value,preset=Object.prototype.hasOwnProperty.call(presetRoles,role)?presetRoles[role]:null;
+    row.querySelector('[data-role-field="enabled"]').checked=enabled.has(role);
+    if(preset){const model=row.querySelector('[data-role-field="model"]');fillModelSelect(model,preset.model,roleModelLabel());model.value=preset.model;syncRoleEffort(row,preset.effort);row.querySelector('[data-role-field="sandboxMode"]').value=preset.sandbox;}
+  }
+  $('cfg-max-sol').value=name==='fast'?0:name==='balanced'?1:2;
+  refreshRoleModelOptions();
+}
 function refreshRoleModelOptions(){
   for(const row of $('roles').children){const select=row.querySelector('[data-role-field="model"]'),value=select.value;fillModelSelect(select,value,roleModelLabel());syncRoleEffort(row);}
   renderTokenRates();
@@ -140,10 +160,11 @@ function modelOptions(value=state.config.model,effort=state.config.reasoningEffo
   $('effort-help').textContent='ระดับที่เลือกใช้กับ Coordinator และเป็นค่าตั้งต้นของ agent ที่ไม่ได้ระบุ effort เอง';
 }
 $('cfg-model').onchange=()=>{modelHelp();fillEffortSelect($('cfg-effort'),$('cfg-model').value,'','ใช้ค่าเริ่มต้นของโมเดล');refreshRoleModelOptions();};
+$('cfg-preset').onchange=e=>applyWorkflowPreset(e.target.value);
 $('refresh-models').onclick=async()=>{const button=$('refresh-models');button.disabled=true;try{const value=$('cfg-model').value,effort=$('cfg-effort').value;const result=await post('models/refresh');state.models=result.models;modelOptions(value,effort);refreshRoleModelOptions();toast('รีเฟรชรายการโมเดลแล้ว');}catch(e){toast(e.message,true);}finally{button.disabled=false;}};
-$('nav-config').onclick=()=>{if(!state)return;$('cfg-workspace').value=state.config.workspace;$('cfg-max').value=state.config.maxAgents;$('cfg-max-sol').value=state.config.maxSolAgents??2;$('cfg-approval').value=state.config.approvalPolicy||'on-request';$('cfg-sandbox').value=state.config.sandboxMode||'workspace-write';$('cfg-instructions').value=state.config.coordinatorInstructions||'';modelOptions();$('roles').innerHTML='';state.config.roles.forEach(addRole);renderTokenRates();$('config-dialog').showModal();};
+$('nav-config').onclick=()=>{if(!state)return;$('cfg-workspace').value=state.config.workspace;$('cfg-max').value=state.config.maxAgents;$('cfg-max-sol').value=state.config.maxSolAgents??2;$('cfg-sol-token-warning').value=state.config.solTokenWarning??50000;$('cfg-preset').value='custom';$('cfg-approval').value=state.config.approvalPolicy||'on-request';$('cfg-sandbox').value=state.config.sandboxMode||'workspace-write';$('cfg-instructions').value=state.config.coordinatorInstructions||'';modelOptions();$('roles').innerHTML='';state.config.roles.forEach(addRole);renderTokenRates();$('config-dialog').showModal();};
 $('nav-monitor').onclick=()=>setView('monitor');$('nav-workflow').onclick=()=>setView('workflow');$('nav-history').onclick=()=>setView('history');$('close-config').onclick=()=>$('config-dialog').close();$('add-role').onclick=()=>{if($('roles').children.length<8)addRole();else toast('เพิ่มได้สูงสุด 8 บทบาท',true);};
-$('config-form').onsubmit=async e=>{e.preventDefault();try{await post('config',{workspace:$('cfg-workspace').value,model:$('cfg-model').value,reasoningEffort:$('cfg-effort').value,maxAgents:Number($('cfg-max').value),maxSolAgents:Number($('cfg-max-sol').value),tokenRates:readTokenRates(),approvalPolicy:$('cfg-approval').value,sandboxMode:$('cfg-sandbox').value,coordinatorInstructions:$('cfg-instructions').value,roles:[...$('roles').children].map(readRole)});$('config-dialog').close();toast('บันทึกแล้ว — ใช้กับงานใหม่และอัปเดต custom agents ใน workspace');}catch(e){toast(e.message,true);}};
+$('config-form').onsubmit=async e=>{e.preventDefault();try{await post('config',{workspace:$('cfg-workspace').value,model:$('cfg-model').value,reasoningEffort:$('cfg-effort').value,maxAgents:Number($('cfg-max').value),maxSolAgents:Number($('cfg-max-sol').value),solTokenWarning:Number($('cfg-sol-token-warning').value),tokenRates:readTokenRates(),approvalPolicy:$('cfg-approval').value,sandboxMode:$('cfg-sandbox').value,coordinatorInstructions:$('cfg-instructions').value,roles:[...$('roles').children].map(readRole)});$('config-dialog').close();toast('บันทึกแล้ว — ใช้กับงานใหม่และอัปเดต custom agents ใน workspace');}catch(e){toast(e.message,true);}};
 function setView(next){view=next;location.hash=next==='monitor'?'':next;$('config-dialog').close();applyView();render();}
 function applyView(){
   $('history-page').hidden=view!=='history';$('workflow-page').hidden=view!=='workflow';$('stats').hidden=view==='history';$('composer').hidden=view==='history';$('approvals').hidden=view==='history';$('monitor-page').hidden=view!=='monitor';document.body.classList.toggle('workflow-view',view==='workflow');
@@ -161,7 +182,9 @@ function agentEffort(a,run){
 }
 function renderWorkflow(agents,run){
   $('flow-run-select').innerHTML=$('run-select').innerHTML;$('flow-run-select').value=selectedRun;
-  $('flow-summary').textContent=run?(run.lastInput||run.prompt)+' · '+(labels[run.status]||run.status)+' · '+agents.length+' agents · Sol subagents '+solSubagentCount(agents)+' / '+(state.config.maxSolAgents??2)+(usageTotals(agents)?' · '+usageTotals(agents):''):'ยังไม่มีงาน — เริ่มงานจากหน้า Live monitor';
+  const solCount=solSubagentCount(agents),solLimit=state.config.maxSolAgents??2,solCountWarning=solCount>solLimit;
+  $('flow-summary').textContent=run?(run.lastInput||run.prompt)+' · '+(labels[run.status]||run.status)+' · '+agents.length+' agents · Sol subagents '+solCount+' / '+solLimit+(solCountWarning?' · ⚠ เกิน Soft limit':'')+(usageTotals(agents)?' · '+usageTotals(agents):''):'ยังไม่มีงาน — เริ่มงานจากหน้า Live monitor';
+  renderRunAnalytics(agents,run);
   $('flow-stop').hidden=$('stop').hidden;
   if(!agents.some(a=>a.id===flowAgent))flowAgent=run?.threadId||agents[0]?.id||'';
   const signature=JSON.stringify([selectedRun,flowAgent,run?.model,run?.reasoningEffort,agents.map(a=>[a.id,a.parentId,a.name,a.status,a.model,a.reasoningEffort,a.task,a.activity,a.tokenUsage])]);
@@ -181,7 +204,7 @@ function renderWorkflow(agents,run){
   }
   const a=agents.find(a=>a.id===flowAgent),inspector=$('flow-inspector');
   const u=a?.tokenUsage?.total,usageText=u?'รวม '+tokenFormat(u.totalTokens)+' · input '+tokenFormat(u.inputTokens)+' · cached '+tokenFormat(u.cachedInputTokens)+' · cache write '+tokenFormat(u.cacheWriteInputTokens)+' · output '+tokenFormat(u.outputTokens)+' · reasoning '+tokenFormat(u.reasoningOutputTokens)+'\n'+costLabel(agentCost(a)):'ยังไม่มีข้อมูล token usage จาก Codex';
-  const detail=a?'<span class="eyebrow">'+(a.parentId?'SUBAGENT':'COORDINATOR')+'</span><h3>'+escape(a.name)+'</h3><span class="badge '+escape(a.status)+'">'+escape(labels[a.status]||a.status)+'</span><dl><dt>โมเดลของ thread</dt><dd>'+escape(agentModel(a,run))+'</dd><dt>Reasoning effort</dt><dd>'+(()=>{const effort=agentEffort(a,run);return effort.value?escape(effortLabels[effort.value]||effort.value)+(effort.defaulted?' · ค่าเริ่มต้นของโมเดล':''):'ไม่ได้ระบุ / ไม่มีข้อมูลจาก Codex'})()+'</dd><dt>Token usage · สะสมของ thread</dt><dd>'+escape(usageText)+'</dd><dt>ตัวหลักที่เชื่อมต่อ</dt><dd>'+escape(state.agents[a.parentId]?.name||'ตัวหลักของงานนี้')+'</dd><dt>งานที่รับผิดชอบ</dt><dd>'+escape(a.task||'ยังไม่มีรายละเอียด')+'</dd><dt>กิจกรรมล่าสุด</dt><dd>'+escape(detailLabels[a.activity]||a.activity||'รอเหตุการณ์')+'</dd></dl>'+(a.output?'<h3>ผลลัพธ์</h3><pre>'+escape(a.output)+'</pre>':'<p>ยังไม่มีผลลัพธ์</p>'):'<h3>รายละเอียด agent</h3><p>คลิกกล่องในแผนผังเพื่อดูงานและผลลัพธ์</p>';
+  const detail=a?'<span class="eyebrow">'+(a.parentId?'SUBAGENT':'COORDINATOR')+'</span><h3>'+escape(a.name)+'</h3><span class="badge '+escape(a.status)+'">'+escape(labels[a.status]||a.status)+'</span><dl><dt>โมเดลของ thread</dt><dd>'+escape(agentModel(a,run))+'</dd><dt>Reasoning effort</dt><dd>'+(()=>{const effort=agentEffort(a,run);return effort.value?escape(effortLabels[effort.value]||effort.value)+(effort.defaulted?' · ค่าเริ่มต้นของโมเดล':''):'ไม่ได้ระบุ / ไม่มีข้อมูลจาก Codex'})()+'</dd><dt>Token usage · สะสมของ thread</dt><dd>'+escape(usageText)+'</dd><dt>เหตุผลที่เรียก agent</dt><dd>'+escape(a.escalationReason||'Coordinator ไม่ได้ส่งเหตุผลใน delegation prompt')+'</dd><dt>ตัวหลักที่เชื่อมต่อ</dt><dd>'+escape(state.agents[a.parentId]?.name||'ตัวหลักของงานนี้')+'</dd><dt>งานที่รับผิดชอบ</dt><dd>'+escape(a.task||'ยังไม่มีรายละเอียด')+'</dd><dt>กิจกรรมล่าสุด</dt><dd>'+escape(detailLabels[a.activity]||a.activity||'รอเหตุการณ์')+'</dd></dl>'+(a.output?'<h3>ผลลัพธ์</h3><pre>'+escape(a.output)+'</pre>':'<p>ยังไม่มีผลลัพธ์</p>'):'<h3>รายละเอียด agent</h3><p>คลิกกล่องในแผนผังเพื่อดูงานและผลลัพธ์</p>';
   if(inspector.innerHTML!==detail)inspector.innerHTML=detail;
 }
 $('flow-stage').onclick=e=>{const node=e.target.closest('[data-flow-agent]');if(node){flowAgent=node.dataset.flowAgent;render();}};

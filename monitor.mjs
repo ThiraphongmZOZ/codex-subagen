@@ -25,6 +25,9 @@ export function estimateTokenCost(usage,rates) {
   if(parts.some(([tokens,rate])=>tokens>0&&(!Number.isFinite(rate)||rate<0)))return null;
   return parts.reduce((sum,[tokens,rate])=>sum+tokens*(Number(rate)||0),0)/1_000_000;
 }
+export function solTokenUsage(agents) {return agents.reduce((total,agent)=>agent.model?.toLowerCase().includes('sol')?total+(Number(agent.tokenUsage?.total?.totalTokens)||0):total,0);}
+export function solTokenWarningExceeded(agents,limit) {return Number.isInteger(limit)&&limit>0&&solTokenUsage(agents)>limit;}
+export function delegationReason(prompt) {return String(prompt||'').match(/^\s*(?:escalation\s+)?reason\s*:\s*([^\r\n]+)/im)?.[1]?.trim().slice(0,500)||null;}
 export function ensureAgent(state,id,extra={}) {
   if (!id) return null;
   state.agents[id] ??= {id,name:'Agent',parentId:null,runId:null,status:'unknown',task:'',activity:'',output:'',turnId:null,updatedAt:new Date().toISOString()};
@@ -82,6 +85,7 @@ export function reduceEvent(state,method,p={}) {
         const old=state.agents[id];
         const child=ensureAgent(state,id,{parentId:old?.parentId||a.id,runId:a.runId});
         if(item.prompt) child.task=item.prompt;
+        child.escalationReason=(typeof item.reason==='string'&&item.reason.trim()?item.reason.trim().slice(0,500):null)||delegationReason(item.prompt)||child.escalationReason||null;
         const s=item.agentsStates?.[id]||item.agentStatus;
         if(s) {
           child.status=({errored:'error',shutdown:'closed',pendingInit:'queued',notFound:'unknown'})[s.status]||s.status;
