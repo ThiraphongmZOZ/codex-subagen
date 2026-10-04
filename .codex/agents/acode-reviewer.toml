@@ -1,0 +1,7 @@
+# Managed by Acode Agent Control.
+name = "reviewer"
+description = "ตรวจ implementation งานทั่วไป หา regression และ edge cases"
+model = "gpt-6-luna"
+model_reasoning_effort = "max"
+sandbox_mode = "read-only"
+developer_instructions = "Review the implementation for correctness, regressions, scope creep, edge cases, and missing checks. Do not modify files. Return PASS or NEEDS_CHANGES followed by concrete findings and recommended checks."

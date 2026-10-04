@@ -1,19 +1,42 @@
 import http from 'node:http';
 import {spawn} from 'node:child_process';
 import {createInterface} from 'node:readline';
-import {readFileSync,writeFileSync,mkdirSync,existsSync,statSync,renameSync} from 'node:fs';
+import {readFileSync,writeFileSync,mkdirSync,existsSync,statSync,renameSync,readdirSync,unlinkSync} from 'node:fs';
 import {fileURLToPath} from 'node:url';
 import path from 'node:path';
 import {randomUUID,randomBytes} from 'node:crypto';
-import {createState,record,ensureAgent,reduceEvent} from './monitor.mjs';
+import {createState,record,ensureAgent,reduceEvent,compareThreadRecency} from './monitor.mjs';
 
 const root=path.dirname(fileURLToPath(import.meta.url));
 const port=Number(process.env.PORT||4310), origin=`http://127.0.0.1:${port}`;
 const dataDir=path.join(root,'data');mkdirSync(dataDir,{recursive:true});
 const configFile=path.join(dataDir,'config.json'), historyFile=path.join(dataDir,'history.json');
-const defaults={workspace:root,model:'',maxAgents:3,roles:[{name:'explorer',instructions:'Inspect the project and gather evidence. Return concise findings.'},{name:'worker',instructions:'Implement the assigned change and verify it.'},{name:'reviewer',instructions:'Review correctness and risks. Return actionable findings.'}]};
-let config=existsSync(configFile)?JSON.parse(readFileSync(configFile,'utf8')):defaults;
+const roleDefaults=[
+  {name:'explorer',description:'สำรวจ repository และส่งหลักฐานให้ Coordinator โดยไม่แก้ไฟล์',model:'gpt-6-luna',reasoningEffort:'',sandboxMode:'read-only',instructions:'Inspect only the files and code paths relevant to the task. Trace current behavior, tests, and evidence. Do not modify files. Return relevant files, code paths, current behavior, evidence, risks, and unknowns concisely.'},
+  {name:'planner',description:'วิเคราะห์ root cause และวางแผนสำหรับงานซับซ้อน โดยไม่ลงมือแก้',model:'gpt-6.1-sol',reasoningEffort:'medium',sandboxMode:'read-only',instructions:'Act as the senior planning agent. Use only the concise evidence supplied by the coordinator. Do not modify files. Return root cause, smallest safe solution, files and exact logic to change, risks, needed checks, and implementation order.'},
+  {name:'worker',description:'ลงมือ implement ตามขอบเขตที่ Coordinator มอบหมาย',model:'gpt-6-luna',reasoningEffort:'medium',sandboxMode:'',instructions:'Implement the assigned change using the approved scope. Modify only necessary files, preserve unrelated behavior, follow project conventions, and inspect the final diff. If blocked, stop and return evidence instead of redesigning the plan.'},
+  {name:'reviewer',description:'ตรวจ implementation งานทั่วไป หา regression และ edge cases',model:'gpt-6-luna',reasoningEffort:'medium',sandboxMode:'read-only',instructions:'Review the implementation for correctness, regressions, scope creep, edge cases, and missing checks. Do not modify files. Return PASS or NEEDS_CHANGES followed by concrete findings and recommended checks.'},
+  {name:'senior_reviewer',description:'ตรวจงานเสี่ยงสูง เช่น business logic, migration, API หรือ architecture ด้วย Sol',model:'gpt-6.1-sol',reasoningEffort:'high',sandboxMode:'read-only',instructions:'Review high-risk business logic, migrations, public APIs, and architecture decisions. Check correctness, data integrity, regressions, security, and missing edge cases. Do not modify files. Lead with concrete findings and state PASS or NEEDS_CHANGES.'}
+];
+const defaultCoordinatorInstructions='You are the coordinator and implementation owner. Start by assessing scope. Handle small, clear tasks directly or delegate one focused implementation task to worker; do not spawn agents just because slots are available. Use explorer for targeted read-only investigation when context is unclear. Escalate to planner only for uncertain root causes, cross-service/data-flow bugs, migrations, architecture, high-risk logic, repeated failed fixes, or several tightly related files. Give planner only concise relevant evidence, then return to worker for implementation. Use reviewer for ordinary changes and senior_reviewer only for high-risk work. Wait for every delegated result before proceeding or summarizing. Prefer Luna for exploration, implementation, and routine checks; use Sol for planning and high-risk review. Avoid sending the whole repository to Sol and avoid concurrent edits to the same files. Every subagent should start with a brief visible commentary line beginning with \"งาน: \".';
+const defaults={version:2,workspace:root,model:'gpt-6-luna',reasoningEffort:'medium',maxAgents:5,maxSolAgents:2,tokenRates:{},approvalPolicy:'on-request',sandboxMode:'workspace-write',coordinatorInstructions:defaultCoordinatorInstructions,roles:roleDefaults};
+const legacyInstructions={explorer:'Inspect the project and gather evidence. Return concise findings.',worker:'Implement the assigned change and verify it.',reviewer:'Review correctness and risks. Return actionable findings.'};
+function normalizeConfig(value) {
+  if(!value||typeof value!=='object')return defaults;
+  const legacy=value.version!==2, savedRoles=Array.isArray(value.roles)?value.roles:[];
+  const roles=savedRoles.map(saved=>{
+    const preset=roleDefaults.find(role=>role.name===saved.name);
+    if(!preset)return {name:saved.name,description:'Custom agent role',model:'',reasoningEffort:'',sandboxMode:'',enabled:true,...saved};
+    const role={...preset,...saved,description:saved.description||preset.description,model:saved.model===undefined?preset.model:saved.model,reasoningEffort:saved.reasoningEffort===undefined?preset.reasoningEffort:saved.reasoningEffort,sandboxMode:saved.sandboxMode===undefined?preset.sandboxMode:saved.sandboxMode,enabled:saved.enabled!==false};
+    if(legacy&&legacyInstructions[saved.name]===saved.instructions)role.instructions=preset.instructions;
+    return role;
+  });
+  if(legacy)for(const role of roleDefaults)if(!roles.some(item=>item.name===role.name))roles.push({...role});
+  return {...defaults,...value,version:2,coordinatorInstructions:value.coordinatorInstructions||defaultCoordinatorInstructions,roles};
+}
+let config=normalizeConfig(existsSync(configFile)?JSON.parse(readFileSync(configFile,'utf8')):defaults);
 const state=createState(), clients=new Set(), pending=new Map(), token=randomBytes(24).toString('hex');
+let codexThreads=[],historyBusy=false,historyTask=Promise.resolve();
 if(existsSync(historyFile)) {
   const old=JSON.parse(readFileSync(historyFile,'utf8'));
   state.runs=old.runs||[];state.agents=old.agents||{};state.events=old.events||[];
@@ -62,11 +85,12 @@ function onMessage(msg) {
     record(state,'request/unsupported',msg.method,msg.params?.threadId);publish();return;
   }
   reduceEvent(state,msg.method,msg.params);
-  const childId=msg.params?.item?.type==='subAgentActivity'?msg.params.item.agentThreadId:null;
-  if(childId&&!hydrated.has(childId)&&state.agents[childId]) {
+  const item=msg.params?.item;
+  const childIds=item?.type==='subAgentActivity'?[item.agentThreadId]:['collabAgentToolCall','collabToolCall'].includes(item?.type)?(item.receiverThreadIds||[item.newThreadId||item.receiverThreadId]):[];
+  for(const childId of childIds) if(childId&&!hydrated.has(childId)&&state.agents[childId]) {
     hydrated.add(childId);
     rpc('thread/read',{threadId:childId,includeTurns:false}).then(({thread})=>{
-      const a=state.agents[childId];if(a){a.task=thread.preview||a.task;a.model=thread.model||a.model;publish();}
+      const a=state.agents[childId];if(a){a.task=thread.preview||a.task;a.model=thread.model||a.model;a.reasoningEffort=thread.reasoningEffort||a.reasoningEffort||null;a.name=thread.agentNickname||thread.agentRole||a.name;publish();}
     }).catch(()=>{hydrated.delete(childId);});
   }
   if(msg.method==='serverRequest/resolved') state.approvals=state.approvals.filter(x=>x.id!==msg.params?.requestId);
@@ -85,9 +109,11 @@ async function connect() {
     state.account=account.account?{type:account.account.type,planType:account.account.planType||null}:null;
     await refreshModels();
     state.connected=true;state.error=null;publish();
-    await Promise.allSettled(Object.values(state.agents).filter(a=>!a.model).map(async a=>{
+    await Promise.allSettled(Object.values(state.agents).filter(a=>!a.model||!a.reasoningEffort||a.name==='Agent').map(async a=>{
       const {thread}=await rpc('thread/read',{threadId:a.id,includeTurns:false});
       a.model=thread.model||null;
+      a.reasoningEffort=thread.reasoningEffort||a.reasoningEffort||null;
+      a.name=thread.agentNickname||thread.agentRole||a.name;
     }));publish();
   })().catch(e=>{state.error=e.message;publish();readyPromise=null;throw e;});
   return readyPromise;
@@ -98,32 +124,148 @@ async function refreshModels() {
     const page=await rpc('model/list',{includeHidden:true,limit:100,cursor});
     models.push(...(page.data||[]));cursor=page.nextCursor;
   } while(cursor);
-  state.models=models.map(m=>({id:m.id,model:m.model,displayName:m.displayName,isDefault:m.isDefault,hidden:!!m.hidden}));
+  state.models=models.map(m=>({id:m.id,model:m.model,displayName:m.displayName,isDefault:m.isDefault,hidden:!!m.hidden,defaultReasoningEffort:m.defaultReasoningEffort,supportedReasoningEfforts:m.supportedReasoningEfforts||[]}));
+}
+function briefThread(t){const source=typeof t.source==='string'?t.source:t.source?.kind||t.source?.type||'Codex';return {id:t.id,name:t.name||'',preview:t.preview||'',model:t.model||null,cwd:t.cwd||'',source,updatedAt:t.updatedAt,archived:t._archived??!!t.archived,status:t.status?.type||'unknown'};}
+async function syncCodexHistory(full=false){
+  if(historyBusy){if(!full)return {count:codexThreads.length};await historyTask.catch(()=>{});return syncCodexHistory(full);}
+  historyBusy=true;
+  historyTask=(async()=>{try{
+    const pages=[];
+    for(const archived of (full?[false,true]:[false])){
+      let cursor=null;
+      do{
+        const page=await rpc('thread/list',{limit:full?100:50,cursor,sortKey:'recency_at',sourceKinds:['cli','vscode'],archived});
+        pages.push(...(page.data||[]).filter(t=>!t.ephemeral).map(t=>({...t,_archived:archived})));cursor=full?page.nextCursor:null;
+      }while(cursor);
+    }
+    const merged=new Map((full?[]:codexThreads).map(t=>[t.id,t]));for(const t of pages)merged.set(t.id,briefThread(t));
+    codexThreads=[...merged.values()].sort(compareThreadRecency);
+    state.historySync={at:new Date().toISOString(),count:codexThreads.length,error:null};publish();
+    return {count:codexThreads.length};
+  }catch(e){state.historySync={...state.historySync,error:e.message};publish();throw e;}
+  })().finally(()=>{historyBusy=false;});
+  return historyTask;
+}
+async function readCodexThread(threadId){
+  if(typeof threadId!=='string'||threadId.length>100)throw Error('Invalid Codex thread id');
+  const {thread}=await rpc('thread/read',{threadId,includeTurns:true});
+  const messages=[];
+  for(const turn of thread.turns||[])for(const item of turn.items||[]){
+    if(item.type==='userMessage'){
+      const text=(item.content||[]).map(c=>c.type==='text'?c.text:c.type==='image'?'[ภาพ]':'').filter(Boolean).join('\n');if(text)messages.push({role:'user',text,at:turn.startedAt});
+    }else if(item.type==='agentMessage'&&item.text)messages.push({role:'assistant',text:item.text,at:turn.startedAt});
+  }
+  const meta={...briefThread(thread),archived:codexThreads.find(t=>t.id===thread.id)?.archived||false},id='codex-history:'+thread.id;
+  const existing=state.runs.find(r=>r.threadId===thread.id);
+  if(existing){existing.model=thread.model||existing.model;existing.reasoningEffort=thread.reasoningEffort||existing.reasoningEffort||null;existing.archived=meta.archived;}
+  else state.runs.push({id,prompt:meta.name||meta.preview||'Codex chat',status:'completed',startedAt:new Date(thread.createdAt*1000).toISOString(),finishedAt:new Date((thread.updatedAt||thread.createdAt)*1000).toISOString(),threadId:thread.id,workspace:thread.cwd,model:thread.model||null,reasoningEffort:thread.reasoningEffort||null,source:meta.source,archived:meta.archived,external:true});
+  ensureAgent(state,thread.id,{name:'Coordinator',runId:existing?.id||id,model:thread.model||null,reasoningEffort:thread.reasoningEffort||existing?.reasoningEffort||null,task:meta.preview||meta.name||'',status:thread.status?.type==='active'?'running':'completed',output:messages.filter(m=>m.role==='assistant').at(-1)?.text||''});
+  publish();return {thread:meta,messages,runId:existing?.id||id};
+}
+const sandboxModes=['read-only','workspace-write','danger-full-access'],approvalPolicies=['untrusted','on-request','never'];
+function validateEffort(modelId,effort,label) {
+  const model=state.models.find(m=>(m.model||m.id)===(modelId||state.models.find(x=>x.isDefault)?.model));
+  if(typeof effort!=='string'||(effort&&!model?.supportedReasoningEfforts.some(e=>e.reasoningEffort===effort)))throw Error(label+' reasoning level is not supported by the selected model');
 }
 function validateConfig(value) {
-  if(!value || typeof value.workspace!=='string'||!path.isAbsolute(value.workspace)||!existsSync(value.workspace)||!statSync(value.workspace).isDirectory()) throw Error('Workspace must be an existing absolute directory');
-  if(!Number.isInteger(value.maxAgents)||value.maxAgents<1||value.maxAgents>8) throw Error('Max agents must be between 1 and 8');
-  if(typeof value.model!=='string'||value.model.length>100) throw Error('Invalid model');
-  if(!Array.isArray(value.roles)||value.roles.length<1||value.roles.length>8) throw Error('Provide 1–8 roles');
-  for(const role of value.roles) if(!/^[a-zA-Z][a-zA-Z0-9_-]{0,39}$/.test(role.name)||typeof role.instructions!=='string'||!role.instructions.trim()||role.instructions.length>4000) throw Error('Invalid role name or instructions');
-  if(new Set(value.roles.map(r=>r.name)).size!==value.roles.length) throw Error('Role names must be unique');
-  return {workspace:path.resolve(value.workspace),model:value.model,maxAgents:value.maxAgents,roles:value.roles.map(r=>({name:r.name,instructions:r.instructions}))};
+  if(!value||typeof value.workspace!=='string'||!path.isAbsolute(value.workspace)||!existsSync(value.workspace)||!statSync(value.workspace).isDirectory())throw Error('Workspace must be an existing absolute directory');
+  if(!Number.isInteger(value.maxAgents)||value.maxAgents<1||value.maxAgents>8)throw Error('Max agents must be between 1 and 8');
+  const maxSolAgents=value.maxSolAgents??defaults.maxSolAgents;
+  if(!Number.isInteger(maxSolAgents)||maxSolAgents<0||maxSolAgents>8)throw Error('Max Sol agents must be between 0 and 8');
+  const tokenRates=value.tokenRates??{};
+  if(!tokenRates||typeof tokenRates!=='object'||Array.isArray(tokenRates)||Object.keys(tokenRates).length>100)throw Error('Invalid token price table');
+  for(const [model,rates] of Object.entries(tokenRates)){
+    if(!model||model.length>100||!rates||typeof rates!=='object'||Array.isArray(rates))throw Error('Invalid token price for '+model);
+    for(const key of ['input','cachedInput','cacheWrite','output'])if(rates[key]!==undefined&&(!Number.isFinite(rates[key])||rates[key]<0||rates[key]>1_000_000))throw Error('Token prices must be non-negative numbers');
+  }
+  if(typeof value.model!=='string'||value.model.length>100)throw Error('Invalid coordinator model');
+  const reasoningEffort=value.reasoningEffort??'';
+  validateEffort(value.model,reasoningEffort,'Coordinator');
+  const approvalPolicy=value.approvalPolicy||'on-request',sandboxMode=value.sandboxMode||'workspace-write';
+  if(!approvalPolicies.includes(approvalPolicy))throw Error('Choose a supported approval mode');
+  if(!sandboxModes.includes(sandboxMode))throw Error('Choose a supported sandbox mode');
+  if(typeof value.coordinatorInstructions!=='string'||!value.coordinatorInstructions.trim()||value.coordinatorInstructions.length>8000)throw Error('Coordinator instructions must be 1–8,000 characters');
+  if(!Array.isArray(value.roles)||value.roles.length<1||value.roles.length>8)throw Error('Provide 1–8 roles');
+  const roles=value.roles.map(role=>{
+    if(!role||!/^[a-z][a-z0-9_-]{0,39}$/.test(role.name)||typeof role.enabled!=='boolean')throw Error('Role names must use lowercase letters, digits, _ or -');
+    if(typeof role.description!=='string'||!role.description.trim()||role.description.length>500)throw Error('Role description must be 1–500 characters');
+    if(typeof role.model!=='string'||role.model.length>100)throw Error('Invalid model for '+role.name);
+    if(typeof role.reasoningEffort!=='string')throw Error('Invalid reasoning level for '+role.name);
+    validateEffort(role.model||value.model,role.reasoningEffort,role.name);
+    if(!['',...sandboxModes].includes(role.sandboxMode))throw Error('Choose a supported permission mode for '+role.name);
+    if(typeof role.instructions!=='string'||!role.instructions.trim()||role.instructions.length>4000)throw Error('Instructions for '+role.name+' must be 1–4,000 characters');
+    return {name:role.name,description:role.description,model:role.model,reasoningEffort:role.reasoningEffort,sandboxMode:role.sandboxMode,enabled:role.enabled,instructions:role.instructions};
+  });
+  if(new Set(roles.map(r=>r.name)).size!==roles.length)throw Error('Role names must be unique');
+  return {version:2,workspace:path.resolve(value.workspace),model:value.model,reasoningEffort,maxAgents:value.maxAgents,maxSolAgents,tokenRates,approvalPolicy,sandboxMode,coordinatorInstructions:value.coordinatorInstructions,roles};
+}
+const agentMarker='# Managed by Acode Agent Control.';
+const agentPath=(workspace,name)=>path.join(workspace,'.codex','agents','acode-'+name+'.toml');
+function agentName(contents){return contents.match(/^name\s*=\s*["']([^"']+)["']/m)?.[1]||'';}
+function agentToml(role) {
+  const lines=[agentMarker,'name = '+JSON.stringify(role.name),'description = '+JSON.stringify(role.description)];
+  if(role.model)lines.push('model = '+JSON.stringify(role.model));
+  if(role.reasoningEffort)lines.push('model_reasoning_effort = '+JSON.stringify(role.reasoningEffort));
+  if(role.sandboxMode)lines.push('sandbox_mode = '+JSON.stringify(role.sandboxMode));
+  lines.push('developer_instructions = '+JSON.stringify(role.instructions),'');
+  return lines.join('\n');
+}
+function writeAgentDefinitions(next,previous=config) {
+  const directory=path.join(next.workspace,'.codex','agents');
+  const active=next.roles.filter(role=>role.enabled);
+  const files=existsSync(directory)?readdirSync(directory).filter(name=>name.toLowerCase().endsWith('.toml')):[];
+  const writes=active.map(role=>{
+    const target=agentPath(next.workspace,role.name),existing=files.map(name=>path.join(directory,name)).find(file=>file.toLowerCase()===target.toLowerCase());
+    if(existing&&!readFileSync(existing,'utf8').includes(agentMarker))throw Error('ไม่สามารถเขียนทับไฟล์ agent ที่มีอยู่: '+existing);
+    const conflict=files.map(name=>path.join(directory,name)).find(file=>{
+      if(file.toLowerCase()===target.toLowerCase())return false;
+      const contents=readFileSync(file,'utf8');
+      return agentName(contents)===role.name&&!contents.includes(agentMarker);
+    });
+    if(conflict)throw Error('พบ custom agent ชื่อ '+role.name+' อยู่แล้วที่ '+conflict+' กรุณาเปลี่ยนชื่อ role ก่อนบันทึก');
+    return {target,contents:agentToml(role)};
+  });
+  if(writes.length)mkdirSync(directory,{recursive:true});
+  for(const file of writes){
+    const temp=file.target+'.acode-tmp';
+    writeFileSync(temp,file.contents,'utf8');renameSync(temp,file.target);
+  }
+  if(previous.workspace===next.workspace)for(const role of previous.roles||[]){
+    if(next.roles.some(item=>item.name===role.name&&item.enabled))continue;
+    const oldPath=agentPath(next.workspace,role.name);
+    if(existsSync(oldPath)&&readFileSync(oldPath,'utf8').includes(agentMarker))unlinkSync(oldPath);
+  }
+}
+function saveConfig(value) {
+  const next=validateConfig(value);
+  writeAgentDefinitions(next,config);
+  const temp=configFile+'.tmp';writeFileSync(temp,JSON.stringify(next,null,2));renameSync(temp,configFile);
+  config=next;publish();
+}
+function hasActiveDashboardWork() {
+  const externalRunIds=new Set(state.runs.filter(run=>run.external).map(run=>run.id));
+  return state.runs.some(run=>!run.external&&['starting','running'].includes(run.status))||Object.values(state.agents).some(agent=>!externalRunIds.has(agent.runId)&&['running','waiting','queued'].includes(agent.status));
 }
 async function startRun(input) {
-  if(starting||state.runs.some(r=>['starting','running'].includes(r.status))||Object.values(state.agents).some(a=>['running','waiting','queued'].includes(a.status))) throw Error('A run is already active. Stop it or wait for completion.');
+  if(starting||hasActiveDashboardWork()) throw Error('A run is already active. Stop it or wait for completion.');
   if(typeof input.prompt!=='string'||!input.prompt.trim()||input.prompt.length>20000) throw Error('Enter a task (up to 20,000 characters)');
-  const cfg=validateConfig(config);starting=true;
+  const cfg=validateConfig(config);writeAgentDefinitions(cfg,cfg);starting=true;
   const run={id:randomUUID(),prompt:input.prompt.trim(),status:'starting',startedAt:new Date().toISOString(),threadId:null,workspace:cfg.workspace};
   try {
     await connect();if(!state.account) throw Error('Sign in to Codex first: run codex login in your terminal');
-    const instructions='You are the coordinator for Acode. Delegate independent tasks to subagents when useful. Name each subagent after its assigned role, tell it its task, and collect results. For the live monitor, instruct each subagent to begin its work with a brief visible commentary line starting with "งาน: " followed by its actual assigned task. If you are a subagent, begin with that task commentary yourself before doing the work. Do not spawn more than '+cfg.maxAgents+' concurrent subagents. Avoid concurrent edits to the same files. Roles:\n'+cfg.roles.map(r=>r.name+': '+r.instructions).join('\n');
+    const roles=cfg.roles.filter(role=>role.enabled);
+    const instructions=cfg.coordinatorInstructions+'\n\nConfigured custom agent roles (delegate using these exact names only):\n'+roles.map(role=>'- '+role.name+' ('+role.model+', '+(role.reasoningEffort||'model default')+'): '+role.description).join('\n')+'\n\nDo not create more than '+cfg.maxAgents+' subagents at once. Use no more than '+cfg.maxSolAgents+' Sol-model subagents across this run, including sequential replacements; once the limit is reached, use a Luna role or do the task yourself. This Sol limit is a coordinator instruction, not an enforced server-side gate. Wait for delegated results before dependent work or the final summary. If no role matches, handle the task yourself.';
     const chosenModel=cfg.model||(state.models.find(m=>m.isDefault)?.model);
     if(!chosenModel) throw Error('No available default model. Choose a model in Configuration.');
-    const params={model:chosenModel,cwd:cfg.workspace,approvalPolicy:'on-request',sandbox:'workspace-write',developerInstructions:instructions,config:{'agents.enabled':true,'agents.max_concurrent_threads_per_session':cfg.maxAgents,'agents.default_subagent_model':chosenModel}};
+    const params={model:chosenModel,cwd:cfg.workspace,approvalPolicy:cfg.approvalPolicy,sandbox:cfg.sandboxMode,developerInstructions:instructions,config:{'agents.enabled':roles.length>0,'agents.max_concurrent_threads_per_session':cfg.maxAgents,'agents.default_subagent_model':chosenModel}};
+    const effort=cfg.reasoningEffort||state.models.find(m=>m.model===chosenModel)?.defaultReasoningEffort;
+    if(effort){params.config.model_reasoning_effort=effort;params.config['agents.default_subagent_reasoning_effort']=effort;}
     run.model=chosenModel;
     const result=await rpc('thread/start',params);
+    run.reasoningEffort=result.reasoningEffort||result.thread.reasoningEffort||effort||null;
     run.threadId=result.thread.id;state.runs.unshift(run);
-    ensureAgent(state,run.threadId,{name:'Coordinator',runId:run.id,model:result.model||result.thread.model||chosenModel,task:run.prompt,status:'queued'});publish();
+    ensureAgent(state,run.threadId,{name:'Coordinator',runId:run.id,model:result.model||result.thread.model||chosenModel,reasoningEffort:run.reasoningEffort,task:run.prompt,status:'queued'});publish();
     const reply=await rpc('turn/start',{threadId:run.threadId,input:[{type:'text',text:run.prompt,text_elements:[]}]});
     const a=state.agents[run.threadId];a.turnId=reply.turn.id;
     // A very short turn may finish before the start response arrives.
@@ -132,23 +274,67 @@ async function startRun(input) {
     record(state,'run/started',run.prompt,run.threadId);publish();return {runId:run.id};
   } catch(e) {if(run.threadId){run.status='error';ensureAgent(state,run.threadId,{status:'error',activity:e.message});publish();}throw e;} finally {starting=false;}
 }
+const busyThreadMessage='thread นี้ถูก Codex/VS Code อีก instance ล็อกไว้ จึงสั่งต่อใน thread เดิมจาก Dashboard ไม่ได้ ให้ปิด thread ต้นทางใน Codex/VS Code เพื่อปล่อย lock แล้วลองอีกครั้ง หรือเลือก “แยก branch แล้วสั่งต่อ” เพื่อทำงานต่อจากประวัติที่บันทึกไว้';
+async function steerActiveThread(run,a,prompt) {
+  let thread;
+  try {({thread}=await rpc('thread/read',{threadId:run.threadId,includeTurns:true}));}
+  catch {return null;}
+  if(thread.status?.type!=='active')return null;
+  if(thread.status.activeFlags?.includes('waitingOnApproval'))throw Error('thread นี้กำลังรออนุมัติคำสั่งใน Codex อีกหน้าต่าง กรุณาอนุมัติหรือปฏิเสธคำขอนั้นก่อน');
+  const turn=[...(thread.turns||[])].reverse().find(item=>item.status==='inProgress');
+  if(!turn||thread.canAcceptDirectInput===false)throw Error(busyThreadMessage);
+  try {
+    const reply=await rpc('turn/steer',{threadId:run.threadId,expectedTurnId:turn.id,input:[{type:'text',text:prompt,text_elements:[]}]});
+    a.turnId=reply.turnId||turn.id;a.model=thread.model||a.model;a.reasoningEffort=thread.reasoningEffort||a.reasoningEffort||null;run.reasoningEffort=a.reasoningEffort;a.status='running';run.status='running';delete run.finishedAt;
+    record(state,'run/continued',prompt,run.threadId);publish();return {runId:run.id,steered:true};
+  } catch {throw Error(busyThreadMessage);}
+}
+async function forkAndContinue(sourceRun,prompt) {
+  if(!sourceRun.external)throw Error('แยก branch ได้จาก thread ที่นำเข้าจาก Codex/VS Code เท่านั้น');
+  starting=true;
+  let run;
+  try {
+    await connect();if(!state.account)throw Error('Sign in to Codex first: run codex login in your terminal');
+    const fork=await rpc('thread/fork',{threadId:sourceRun.threadId,excludeTurns:true});
+    const thread=fork.thread;
+    run={id:randomUUID(),prompt:'Branch: '+sourceRun.prompt,status:'starting',startedAt:new Date().toISOString(),threadId:thread.id,workspace:thread.cwd||sourceRun.workspace,model:fork.model||thread.model||sourceRun.model||null,reasoningEffort:fork.reasoningEffort||thread.reasoningEffort||sourceRun.reasoningEffort||null,source:sourceRun.source,archived:false,external:false,forkedFromId:sourceRun.threadId,lastInput:prompt};
+    state.runs.unshift(run);
+    const agent=ensureAgent(state,thread.id,{name:'Coordinator',runId:run.id,model:run.model,reasoningEffort:run.reasoningEffort,task:prompt,status:'queued'});publish();
+    const reply=await rpc('turn/start',{threadId:thread.id,input:[{type:'text',text:prompt,text_elements:[]}]});
+    agent.turnId=reply.turn.id;if(run.status==='starting')run.status='running';if(agent.status==='queued')agent.status='running';
+    record(state,'run/started',prompt,thread.id);publish();return {runId:run.id,forked:true};
+  } catch(e) {
+    if(run){run.status='error';run.finishedAt=new Date().toISOString();const a=state.agents[run.threadId];if(a){a.status='error';a.activity=e.message;}publish();}
+    if(/active writer/i.test(e.message))throw Error('Codex ยังล็อกประวัติต้นทางอยู่ จึงสร้าง branch ไม่สำเร็จ ให้ปิด thread ต้นทางใน Codex/VS Code แล้วลองอีกครั้ง');
+    throw e;
+  } finally {starting=false;}
+}
 async function continueRun(input) {
-  if(starting||state.runs.some(r=>['starting','running'].includes(r.status))||Object.values(state.agents).some(a=>['running','waiting','queued'].includes(a.status))) throw Error('A run is already active. Wait for completion or stop it first.');
   if(typeof input.prompt!=='string'||!input.prompt.trim()||input.prompt.length>20000) throw Error('Enter a follow-up (up to 20,000 characters)');
   const run=state.runs.find(r=>r.id===input.runId);
   if(!run?.threadId) throw Error('Choose a conversation started from this dashboard');
-  if(!['completed','error','interrupted','unknown'].includes(run.status)) throw Error('This conversation is not ready for a follow-up');
   const a=state.agents[run.threadId];if(!a) throw Error('Coordinator thread was not found');
-  const previousStatus=run.status;starting=true;run.status='starting';run.lastInput=input.prompt.trim();publish();
+  const external=!!run.external;
+  const targetActive=external&&(['running','waiting'].includes(run.status)||['running','waiting'].includes(a.status));
+  if(starting||hasActiveDashboardWork()) throw Error('A run is already active. Wait for completion or stop it first.');
+  if(!['completed','error','interrupted','unknown'].includes(run.status)&&!targetActive) throw Error('This conversation is not ready for a follow-up');
+  if(input.fork)return forkAndContinue(run,input.prompt.trim());
+  const previousStatus=run.status,previousLastInput=run.lastInput;starting=true;run.status='starting';run.lastInput=input.prompt.trim();publish();
   try {
     await connect();if(!state.account) throw Error('Sign in to Codex first: run codex login in your terminal');
-    const resumed=await rpc('thread/resume',{threadId:run.threadId});a.model=resumed.model||resumed.thread.model||a.model;
-    const reply=await rpc('turn/start',{threadId:run.threadId,input:[{type:'text',text:input.prompt.trim(),text_elements:[]}]});
+    if(run.external&&run.archived){await rpc('thread/unarchive',{threadId:run.threadId});run.archived=false;}
+    const prompt=input.prompt.trim(),steered=await steerActiveThread(run,a,prompt);if(steered)return steered;
+    let resumed;
+    try {resumed=await rpc('thread/resume',{threadId:run.threadId});}
+    catch(e) {if(/active writer/i.test(e.message)){const result=await steerActiveThread(run,a,prompt);if(result)return result;throw Error(busyThreadMessage);}throw e;}
+    a.model=resumed.model||resumed.thread.model||a.model;a.reasoningEffort=resumed.reasoningEffort||resumed.thread.reasoningEffort||a.reasoningEffort||null;run.reasoningEffort=a.reasoningEffort;
+    const reply=await rpc('turn/start',{threadId:run.threadId,input:[{type:'text',text:prompt,text_elements:[]}]});
     a.turnId=reply.turn.id;
     if(run.status==='starting'){run.status='running';a.status='running';}
-    delete run.finishedAt;record(state,'run/continued',input.prompt.trim(),run.threadId);publish();return {runId:run.id};
+    delete run.finishedAt;record(state,'run/continued',prompt,run.threadId);publish();return {runId:run.id};
   } catch(e) {
     if(run.status==='starting') run.status=previousStatus;
+    if(run.lastInput===input.prompt.trim())run.lastInput=previousLastInput;
     a.activity=e.message;publish();throw e;
   } finally {starting=false;}
 }
@@ -167,7 +353,7 @@ async function readBody(req) {
   let body='';for await(const chunk of req) {body+=chunk;if(body.length>100000)throw Error('Request too large');}
   return JSON.parse(body||'{}');
 }
-const staticFiles={'/':['index.html','text/html; charset=utf-8'],'/app.js':['app.js','text/javascript; charset=utf-8'],'/style.css':['style.css','text/css; charset=utf-8']};
+const staticFiles={'/':['index.html','text/html; charset=utf-8'],'/app.js':['app.js','text/javascript; charset=utf-8'],'/monitor.mjs':['monitor.mjs','text/javascript; charset=utf-8'],'/style.css':['style.css','text/css; charset=utf-8']};
 const server=http.createServer(async(req,res)=>{
   const json=(value,code=200)=>{res.writeHead(code,{'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store'});res.end(JSON.stringify(value));};
   try {
@@ -184,7 +370,7 @@ const server=http.createServer(async(req,res)=>{
     if(req.method==='POST'&&url.pathname.startsWith('/api/')) {
       if(req.headers['x-acode-token']!==token) return json({error:'Reload dashboard to reconnect'},403);
       const body=await readBody(req);
-      if(url.pathname==='/api/config') {config=validateConfig(body);const tmp=configFile+'.tmp';writeFileSync(tmp,JSON.stringify(config,null,2));renameSync(tmp,configFile);publish();return json({ok:true});}
+      if(url.pathname==='/api/config') {saveConfig(body);return json({ok:true});}
       if(url.pathname==='/api/run')return json(await startRun(body));
       if(url.pathname==='/api/continue')return json(await continueRun(body));
       if(url.pathname==='/api/stop')return json(await stopRun(body.runId));
@@ -193,17 +379,25 @@ const server=http.createServer(async(req,res)=>{
         state.account=account.account?{type:account.account.type,planType:account.account.planType||null}:null;await refreshModels();publish();return json({ok:true});
       }
       if(url.pathname==='/api/models/refresh'){await connect();await refreshModels();publish();return json({models:state.models});}
+      if(url.pathname==='/api/history/sync')return json(await syncCodexHistory(true));
+      if(url.pathname==='/api/history/read')return json(await readCodexThread(body.threadId));
       if(url.pathname==='/api/approval') {
         const request=state.approvals.find(a=>a.id===body.id);if(!request||!['accept','decline'].includes(body.decision))throw Error('Invalid approval response');
         send({id:request.id,result:{decision:body.decision}});state.approvals=state.approvals.filter(a=>a.id!==request.id);
         const a=state.agents[request.params.threadId];if(a)a.status='running';publish();return json({ok:true});
       }
     }
+    if(req.method==='GET'&&url.pathname==='/api/history'){
+      const search=(url.searchParams.get('q')||'').trim().toLocaleLowerCase();const offset=Math.max(0,Number(url.searchParams.get('offset')||0));const limit=Math.min(100,Math.max(1,Number(url.searchParams.get('limit')||50)));
+      const rows=search?codexThreads.filter(t=>(t.name+' '+t.preview+' '+t.cwd).toLocaleLowerCase().includes(search)):codexThreads;
+      return json({threads:rows.slice(offset,offset+limit),total:rows.length,sync:state.historySync||null});
+    }
     if(req.method==='GET'&&staticFiles[url.pathname]) {const [file,type]=staticFiles[url.pathname];res.writeHead(200,{'Content-Type':type,'Cache-Control':'no-cache'});return res.end(readFileSync(path.join(root,file)));}
     json({error:'Not found'},404);
   }catch(e){json({error:e.message},400);}
 });
-server.listen(port,'127.0.0.1',()=>{console.log('Acode dashboard: '+origin);connect().catch(()=>{});});
+server.listen(port,'127.0.0.1',()=>{console.log('Acode dashboard: '+origin);connect().then(()=>syncCodexHistory(true)).catch(()=>{});});
+setInterval(()=>{if(state.connected&&!historyBusy)syncCodexHistory(false).catch(()=>{});},30000).unref();
 server.on('error',e=>{console.error(e.message);proc?.kill();process.exitCode=1;});
 function shutdown(){clearTimeout(saveTimer);try{persist();}catch{}proc?.kill();for(const c of clients)c.end();server.close(()=>process.exit());setTimeout(()=>process.exit(),2000).unref();}
 process.on('SIGINT',shutdown);process.on('SIGTERM',shutdown);

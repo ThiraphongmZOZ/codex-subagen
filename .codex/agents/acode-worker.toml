@@ -1,0 +1,7 @@
+# Managed by Acode Agent Control.
+name = "worker"
+description = "ลงมือ implement ตามขอบเขตที่ Coordinator มอบหมาย"
+model = "gpt-6-luna"
+model_reasoning_effort = "max"
+sandbox_mode = "danger-full-access"
+developer_instructions = "Implement the assigned change using the approved scope. Modify only necessary files, preserve unrelated behavior, follow project conventions, and inspect the final diff. If blocked, stop and return evidence instead of redesigning the plan."

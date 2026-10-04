@@ -5,6 +5,26 @@ export function record(state, method, detail, threadId=null) {
   state.events.unshift({time:new Date().toISOString(),method,detail:String(detail).slice(0,1200),threadId});
   state.events.length=Math.min(state.events.length,250);
 }
+function timestamp(value) {
+  const numeric=typeof value==='number'?value:typeof value==='string'&&value.trim()?Number(value):NaN;
+  if(Number.isFinite(numeric))return numeric<1e12?numeric*1000:numeric;
+  const parsed=typeof value==='string'?Date.parse(value):NaN;
+  return Number.isFinite(parsed)?parsed:0;
+}
+export function compareThreadRecency(a,b) {return timestamp(b.updatedAt)-timestamp(a.updatedAt);}
+const usageFields=['totalTokens','inputTokens','cachedInputTokens','cacheWriteInputTokens','outputTokens','reasoningOutputTokens'];
+export function sumTokenUsage(agents) {
+  const total=Object.fromEntries(usageFields.map(field=>[field,0]));
+  for(const agent of agents)for(const field of usageFields)total[field]+=Number(agent.tokenUsage?.total?.[field])||0;
+  return total;
+}
+export function estimateTokenCost(usage,rates) {
+  if(!usage||!rates)return null;
+  const input=Number(usage.inputTokens)||0,cached=Math.min(input,Number(usage.cachedInputTokens)||0),written=Math.min(input-cached,Number(usage.cacheWriteInputTokens)||0);
+  const parts=[[input-cached-written,rates.input],[cached,rates.cachedInput],[written,rates.cacheWrite],[Number(usage.outputTokens)||0,rates.output]];
+  if(parts.some(([tokens,rate])=>tokens>0&&(!Number.isFinite(rate)||rate<0)))return null;
+  return parts.reduce((sum,[tokens,rate])=>sum+tokens*(Number(rate)||0),0)/1_000_000;
+}
 export function ensureAgent(state,id,extra={}) {
   if (!id) return null;
   state.agents[id] ??= {id,name:'Agent',parentId:null,runId:null,status:'unknown',task:'',activity:'',output:'',turnId:null,updatedAt:new Date().toISOString()};
@@ -16,7 +36,7 @@ export function reduceEvent(state,method,p={}) {
     const parent=state.agents[thread.parentThreadId];
     // Only monitor threads belonging to runs started by this dashboard.
     if (!state.agents[thread.id] && !parent) return;
-    ensureAgent(state,thread.id,{name:thread.agentNickname||thread.agentRole||(parent?'Subagent':'Coordinator'),parentId:thread.parentThreadId||null,runId:parent?.runId||state.agents[thread.id]?.runId,model:thread.model||state.agents[thread.id]?.model||null,task:thread.preview||state.agents[thread.id]?.task||''});
+    ensureAgent(state,thread.id,{name:thread.agentNickname||thread.agentRole||(parent?'Subagent':'Coordinator'),parentId:thread.parentThreadId||null,runId:parent?.runId||state.agents[thread.id]?.runId,model:thread.model||state.agents[thread.id]?.model||null,reasoningEffort:thread.reasoningEffort||state.agents[thread.id]?.reasoningEffort||null,task:thread.preview||state.agents[thread.id]?.task||''});
   }
   const a=state.agents[p.threadId];
   if (!a) return;
