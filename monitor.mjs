@@ -13,21 +13,25 @@ function timestamp(value) {
 }
 export function compareThreadRecency(a,b) {return timestamp(b.updatedAt)-timestamp(a.updatedAt);}
 const usageFields=['totalTokens','inputTokens','cachedInputTokens','cacheWriteInputTokens','outputTokens','reasoningOutputTokens'];
+const tokenCount=value=>{const number=Number(value);return Number.isFinite(number)&&number>0?number:0;};
 export function sumTokenUsage(agents) {
   const total=Object.fromEntries(usageFields.map(field=>[field,0]));
-  for(const agent of agents)for(const field of usageFields)total[field]+=Number(agent.tokenUsage?.total?.[field])||0;
+  for(const agent of agents)for(const field of usageFields)total[field]+=tokenCount(agent.tokenUsage?.total?.[field]);
   return total;
 }
 export function estimateTokenCost(usage,rates) {
   if(!usage||!rates)return null;
-  const input=Number(usage.inputTokens)||0,cached=Math.min(input,Number(usage.cachedInputTokens)||0),written=Math.min(input-cached,Number(usage.cacheWriteInputTokens)||0);
-  const parts=[[input-cached-written,rates.input],[cached,rates.cachedInput],[written,rates.cacheWrite],[Number(usage.outputTokens)||0,rates.output]];
+  const input=tokenCount(usage.inputTokens),cached=Math.min(input,tokenCount(usage.cachedInputTokens)),written=Math.min(input-cached,tokenCount(usage.cacheWriteInputTokens));
+  const parts=[[input-cached-written,rates.input],[cached,rates.cachedInput],[written,rates.cacheWrite],[tokenCount(usage.outputTokens),rates.output]];
   if(parts.some(([tokens,rate])=>tokens>0&&(!Number.isFinite(rate)||rate<0)))return null;
-  return parts.reduce((sum,[tokens,rate])=>sum+tokens*(Number(rate)||0),0)/1_000_000;
+  const cost=parts.reduce((sum,[tokens,rate])=>sum+tokens*(Number.isFinite(rate)&&rate>=0?rate:0),0)/1_000_000;
+  return Number.isFinite(cost)?cost:null;
 }
-export function solTokenUsage(agents) {return agents.reduce((total,agent)=>agent.model?.toLowerCase().includes('sol')?total+(Number(agent.tokenUsage?.total?.totalTokens)||0):total,0);}
+export function solTokenUsage(agents) {return agents.reduce((total,agent)=>typeof agent.model==='string'&&agent.model.toLowerCase().includes('sol')?total+tokenCount(agent.tokenUsage?.total?.totalTokens):total,0);}
 export function solTokenWarningExceeded(agents,limit) {return Number.isInteger(limit)&&limit>0&&solTokenUsage(agents)>limit;}
 export function delegationReason(prompt) {return String(prompt||'').match(/^\s*(?:escalation\s+)?reason\s*:\s*([^\r\n]+)/im)?.[1]?.trim().slice(0,500)||null;}
+export function delegationReasonLabel(value) {return typeof value==='string'&&value.trim()?value.trim():'ไม่ได้ระบุ';}
+export function agentsForRun(agents,runId) {return agents.filter(agent=>agent.runId===runId);}
 export function ensureAgent(state,id,extra={}) {
   if (!id) return null;
   state.agents[id] ??= {id,name:'Agent',parentId:null,runId:null,status:'unknown',task:'',activity:'',output:'',turnId:null,updatedAt:new Date().toISOString()};

@@ -1,5 +1,6 @@
 import {readFileSync,writeFileSync,mkdirSync,existsSync,renameSync,readdirSync,unlinkSync} from 'node:fs';
 import path from 'node:path';
+import {randomUUID} from 'node:crypto';
 
 export const roleDefaults=[
   {name:'explorer',description:'สำรวจ repository และส่งหลักฐานให้ Coordinator โดยไม่แก้ไฟล์',model:'gpt-6-luna',reasoningEffort:'',sandboxMode:'read-only',instructions:'Inspect only the files and code paths relevant to the task. Trace current behavior, tests, and evidence. Do not modify files. Return relevant files, code paths, current behavior, evidence, risks, and unknowns concisely.'},
@@ -20,31 +21,47 @@ function agentToml(role) {
   lines.push('developer_instructions = '+JSON.stringify(role.instructions),'');
   return lines.join('\n');
 }
-export function writeAgentDefinitions(next,previous={workspace:next.workspace,roles:[]}) {
+export function writeAgentDefinitions(next,previous={workspace:next.workspace,roles:[]},operations={}) {
+  const io={writeFileSync,renameSync,unlinkSync,...operations};
   const directory=path.join(next.workspace,'.codex','agents');
   const active=next.roles.filter(role=>role.enabled);
   const files=existsSync(directory)?readdirSync(directory).filter(name=>name.toLowerCase().endsWith('.toml')):[];
   const writes=active.map(role=>{
     const target=agentPath(next.workspace,role.name),existing=files.map(name=>path.join(directory,name)).find(file=>file.toLowerCase()===target.toLowerCase());
-    if(existing&&!readFileSync(existing,'utf8').includes(agentMarker))throw Error('ไม่สามารถเขียนทับไฟล์ agent ที่มีอยู่: '+existing);
+    const existingContents=existing?readFileSync(existing,'utf8'):null;
+    if(existingContents!==null&&!existingContents.includes(agentMarker))throw Error('ไม่สามารถเขียนทับไฟล์ agent ที่มีอยู่: '+existing);
     const conflict=files.map(name=>path.join(directory,name)).find(file=>{
       if(file.toLowerCase()===target.toLowerCase())return false;
       const contents=readFileSync(file,'utf8');
       return agentName(contents)===role.name&&!contents.includes(agentMarker);
     });
     if(conflict)throw Error('พบ custom agent ชื่อ '+role.name+' อยู่แล้วที่ '+conflict+' กรุณาเปลี่ยนชื่อ role ก่อนบันทึก');
-    return {target,contents:agentToml(role)};
+    return {target,contents:agentToml(role),existingContents,temp:target+'.acode-tmp-'+randomUUID(),committed:false};
   });
-  if(writes.length)mkdirSync(directory,{recursive:true});
-  for(const file of writes){
-    const temp=file.target+'.acode-tmp';
-    writeFileSync(temp,file.contents,'utf8');renameSync(temp,file.target);
-  }
   const changedWorkspace=!samePath(previous.workspace,next.workspace),cleanupWorkspace=changedWorkspace?previous.workspace:next.workspace;
+  const removals=[];
   for(const role of previous.roles||[]){
     if(!/^[a-z][a-z0-9_-]{0,39}$/.test(role.name))continue;
     if(!changedWorkspace&&next.roles.some(item=>item.name===role.name&&item.enabled))continue;
-    const oldPath=agentPath(cleanupWorkspace,role.name);
-    if(existsSync(oldPath)&&readFileSync(oldPath,'utf8').includes(agentMarker))unlinkSync(oldPath);
+    const target=agentPath(cleanupWorkspace,role.name);
+    if(existsSync(target)){const contents=readFileSync(target,'utf8');if(contents.includes(agentMarker))removals.push({target,contents,removed:false});}
+  }
+  if(writes.length)mkdirSync(directory,{recursive:true});
+  try{
+    for(const file of writes)io.writeFileSync(file.temp,file.contents,'utf8');
+    for(const file of writes){io.renameSync(file.temp,file.target);file.committed=true;}
+    for(const file of removals){io.unlinkSync(file.target);file.removed=true;}
+  }catch(error){
+    const rollbackErrors=[];
+    for(const file of removals.filter(item=>item.removed).reverse())try{
+      const temp=file.target+'.acode-rollback-'+randomUUID();io.writeFileSync(temp,file.contents,'utf8');io.renameSync(temp,file.target);
+    }catch(rollbackError){rollbackErrors.push(rollbackError.message);}
+    for(const file of writes.filter(item=>item.committed).reverse())try{
+      if(file.existingContents!==null){const temp=file.target+'.acode-rollback-'+randomUUID();io.writeFileSync(temp,file.existingContents,'utf8');io.renameSync(temp,file.target);}
+      else if(existsSync(file.target))io.unlinkSync(file.target);
+    }catch(rollbackError){rollbackErrors.push(rollbackError.message);}
+    for(const file of writes)if(existsSync(file.temp))try{io.unlinkSync(file.temp);}catch(rollbackError){rollbackErrors.push(rollbackError.message);}
+    const suffix=rollbackErrors.length?'; rollback incomplete: '+rollbackErrors.join('; '):'; managed agent files were rolled back';
+    throw Error('Could not update managed agent files: '+error.message+suffix);
   }
 }

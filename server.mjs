@@ -13,7 +13,7 @@ const port=Number(process.env.PORT||4310), origin=`http://127.0.0.1:${port}`;
 const dataDir=path.join(root,'data');mkdirSync(dataDir,{recursive:true});
 const configFile=path.join(dataDir,'config.json'), historyFile=path.join(dataDir,'history.json');
 const defaultCoordinatorInstructions='You are the coordinator and implementation owner. Start by assessing scope. Handle small, clear tasks directly or delegate one focused implementation task to worker; do not spawn agents just because slots are available. Use explorer for targeted read-only investigation when context is unclear. Escalate to planner only for uncertain root causes, cross-service/data-flow bugs, migrations, architecture, high-risk logic, repeated failed fixes, or several tightly related files. Give planner only concise relevant evidence, then return to worker for implementation. Use reviewer for ordinary changes and senior_reviewer only for high-risk work. Wait for every delegated result before proceeding or summarizing. Prefer Luna for exploration, implementation, and routine checks; use Sol for planning and high-risk review. Avoid sending the whole repository to Sol and avoid concurrent edits to the same files. Every subagent should start with a brief visible commentary line beginning with \"งาน: \".';
-const defaults={version:2,workspace:root,model:'gpt-6-luna',reasoningEffort:'medium',maxAgents:5,maxSolAgents:2,solTokenWarning:50000,tokenRates:{},approvalPolicy:'on-request',sandboxMode:'workspace-write',coordinatorInstructions:defaultCoordinatorInstructions,roles:roleDefaults};
+const defaults={version:2,workspace:root,model:'gpt-6-luna',reasoningEffort:'medium',maxAgents:5,maxSolAgents:2,solTokenWarning:50000,workflowPreset:'custom',tokenRates:{},approvalPolicy:'on-request',sandboxMode:'workspace-write',coordinatorInstructions:defaultCoordinatorInstructions,roles:roleDefaults};
 const legacyInstructions={explorer:'Inspect the project and gather evidence. Return concise findings.',worker:'Implement the assigned change and verify it.',reviewer:'Review correctness and risks. Return actionable findings.'};
 function normalizeConfig(value) {
   if(!value||typeof value!=='object')return defaults;
@@ -169,6 +169,8 @@ function validateConfig(value) {
   if(!Number.isInteger(maxSolAgents)||maxSolAgents<0||maxSolAgents>8)throw Error('Max Sol agents must be between 0 and 8');
   const solTokenWarning=value.solTokenWarning??defaults.solTokenWarning;
   if(!Number.isInteger(solTokenWarning)||solTokenWarning<0||solTokenWarning>10_000_000)throw Error('Sol token warning must be between 0 and 10,000,000');
+  const workflowPreset=value.workflowPreset??'custom';
+  if(!['custom','fast','balanced','safe'].includes(workflowPreset))throw Error('Choose a supported workflow preset');
   const tokenRates=value.tokenRates??{};
   if(!tokenRates||typeof tokenRates!=='object'||Array.isArray(tokenRates)||Object.keys(tokenRates).length>100)throw Error('Invalid token price table');
   for(const [model,rates] of Object.entries(tokenRates)){
@@ -194,7 +196,7 @@ function validateConfig(value) {
     return {name:role.name,description:role.description,model:role.model,reasoningEffort:role.reasoningEffort,sandboxMode:role.sandboxMode,enabled:role.enabled,instructions:role.instructions};
   });
   if(new Set(roles.map(r=>r.name)).size!==roles.length)throw Error('Role names must be unique');
-  return {version:2,workspace:path.resolve(value.workspace),model:value.model,reasoningEffort,maxAgents:value.maxAgents,maxSolAgents,solTokenWarning,tokenRates,approvalPolicy,sandboxMode,coordinatorInstructions:value.coordinatorInstructions,roles};
+  return {version:2,workspace:path.resolve(value.workspace),model:value.model,reasoningEffort,maxAgents:value.maxAgents,maxSolAgents,solTokenWarning,workflowPreset,tokenRates,approvalPolicy,sandboxMode,coordinatorInstructions:value.coordinatorInstructions,roles};
 }
 function saveConfig(value) {
   const next=validateConfig(value);
@@ -210,7 +212,7 @@ async function startRun(input) {
   if(starting||hasActiveDashboardWork()) throw Error('A run is already active. Stop it or wait for completion.');
   if(typeof input.prompt!=='string'||!input.prompt.trim()||input.prompt.length>20000) throw Error('Enter a task (up to 20,000 characters)');
   const cfg=validateConfig(config);writeAgentDefinitions(cfg,cfg);starting=true;
-  const run={id:randomUUID(),prompt:input.prompt.trim(),status:'starting',startedAt:new Date().toISOString(),threadId:null,workspace:cfg.workspace};
+  const run={id:randomUUID(),prompt:input.prompt.trim(),status:'starting',startedAt:new Date().toISOString(),threadId:null,workspace:cfg.workspace,workflowPreset:cfg.workflowPreset};
   try {
     await connect();if(!state.account) throw Error('Sign in to Codex first: run codex login in your terminal');
     const roles=cfg.roles.filter(role=>role.enabled);
@@ -256,7 +258,7 @@ async function forkAndContinue(sourceRun,prompt) {
     await connect();if(!state.account)throw Error('Sign in to Codex first: run codex login in your terminal');
     const fork=await rpc('thread/fork',{threadId:sourceRun.threadId,excludeTurns:true});
     const thread=fork.thread;
-    run={id:randomUUID(),prompt:'Branch: '+sourceRun.prompt,status:'starting',startedAt:new Date().toISOString(),threadId:thread.id,workspace:thread.cwd||sourceRun.workspace,model:fork.model||thread.model||sourceRun.model||null,reasoningEffort:fork.reasoningEffort||thread.reasoningEffort||sourceRun.reasoningEffort||null,source:sourceRun.source,archived:false,external:false,forkedFromId:sourceRun.threadId,lastInput:prompt};
+    run={id:randomUUID(),prompt:'Branch: '+sourceRun.prompt,status:'starting',startedAt:new Date().toISOString(),threadId:thread.id,workspace:thread.cwd||sourceRun.workspace,model:fork.model||thread.model||sourceRun.model||null,reasoningEffort:fork.reasoningEffort||thread.reasoningEffort||sourceRun.reasoningEffort||null,workflowPreset:sourceRun.workflowPreset||config.workflowPreset,source:sourceRun.source,archived:false,external:false,forkedFromId:sourceRun.threadId,lastInput:prompt};
     state.runs.unshift(run);
     const agent=ensureAgent(state,thread.id,{name:'Coordinator',runId:run.id,model:run.model,reasoningEffort:run.reasoningEffort,task:prompt,status:'queued'});publish();
     const reply=await rpc('turn/start',{threadId:thread.id,input:[{type:'text',text:prompt,text_elements:[]}]});
@@ -308,6 +310,12 @@ async function stopRun(id) {
   if(results.some(r=>r.status==='rejected')) throw Error('Could not stop every agent; inspect current status');
   run.status='interrupted';publish();return {ok:true};
 }
+function saveSolFeedback(input){
+  if(typeof input.runId!=='string'||typeof input.useful!=='boolean')throw Error('Choose whether Sol was useful for this run');
+  const run=state.runs.find(item=>item.id===input.runId);
+  if(!run||!['completed','error','interrupted'].includes(run.status))throw Error('Feedback is available after a run finishes');
+  run.solUseful=input.useful;run.solFeedbackAt=new Date().toISOString();publish();return {ok:true};
+}
 async function readBody(req) {
   let body='';for await(const chunk of req) {body+=chunk;if(body.length>100000)throw Error('Request too large');}
   return JSON.parse(body||'{}');
@@ -333,6 +341,7 @@ const server=http.createServer(async(req,res)=>{
       if(url.pathname==='/api/run')return json(await startRun(body));
       if(url.pathname==='/api/continue')return json(await continueRun(body));
       if(url.pathname==='/api/stop')return json(await stopRun(body.runId));
+      if(url.pathname==='/api/run/feedback')return json(saveSolFeedback(body));
       if(url.pathname==='/api/reconnect'){
         await connect();const account=await rpc('account/read',{refreshToken:false});
         state.account=account.account?{type:account.account.type,planType:account.account.planType||null}:null;await refreshModels();publish();return json({ok:true});

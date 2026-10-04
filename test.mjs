@@ -1,9 +1,9 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
-import {existsSync,mkdirSync,mkdtempSync,readFileSync,rmSync,writeFileSync} from 'node:fs';
+import {existsSync,mkdirSync,mkdtempSync,readFileSync,readdirSync,renameSync,rmSync,unlinkSync,writeFileSync} from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import {createState,ensureAgent,reduceEvent,compareThreadRecency,sumTokenUsage,estimateTokenCost,solTokenUsage,solTokenWarningExceeded,delegationReason} from './monitor.mjs';
+import {createState,ensureAgent,reduceEvent,compareThreadRecency,sumTokenUsage,estimateTokenCost,solTokenUsage,solTokenWarningExceeded,delegationReason,delegationReasonLabel,agentsForRun} from './monitor.mjs';
 import {roleDefaults,writeAgentDefinitions} from './agent-config.mjs';
 test('real protocol events build a parent/child tree and maintain completed status',()=>{
  const s=createState();s.runs.push({id:'run',threadId:'root',status:'running'});
@@ -46,13 +46,23 @@ test('history recency sorts ISO dates and Unix timestamps newest first',()=>{
 test('thread token usage is retained and summed by agent without double-counting output details',()=>{
  const s=createState();ensureAgent(s,'root',{runId:'r'});ensureAgent(s,'child',{runId:'r'});
  reduceEvent(s,'thread/tokenUsage/updated',{threadId:'root',tokenUsage:{total:{totalTokens:150,inputTokens:100,cachedInputTokens:20,cacheWriteInputTokens:10,outputTokens:50,reasoningOutputTokens:8}}});
+ reduceEvent(s,'thread/tokenUsage/updated',{threadId:'root',tokenUsage:{total:{totalTokens:150,inputTokens:100,cachedInputTokens:20,cacheWriteInputTokens:10,outputTokens:50,reasoningOutputTokens:8}}});
  reduceEvent(s,'thread/tokenUsage/updated',{threadId:'child',tokenUsage:{total:{totalTokens:40,inputTokens:25,cachedInputTokens:5,cacheWriteInputTokens:0,outputTokens:15,reasoningOutputTokens:3}}});
  assert.equal(s.agents.root.tokenUsage.total.inputTokens,100);assert.equal(sumTokenUsage(Object.values(s.agents)).totalTokens,190);
 });
-test('API-equivalent token estimate uses custom cache and output rates and needs rates for used buckets',()=>{
+test('API-equivalent estimate rejects invalid rates and ignores malformed token counts without NaN',()=>{
  const usage={inputTokens:100,cachedInputTokens:20,cacheWriteInputTokens:10,outputTokens:40};
  assert.equal(estimateTokenCost(usage,{input:1,cachedInput:0.5,cacheWrite:2,output:3}),0.00022);
  assert.equal(estimateTokenCost(usage,{input:1,output:3}),null);
+ for(const rate of [NaN,Infinity,-1,null])assert.equal(estimateTokenCost(usage,{input:rate,cachedInput:0.5,cacheWrite:2,output:3}),null);
+ const malformed={inputTokens:Infinity,cachedInputTokens:-3,cacheWriteInputTokens:'bad',outputTokens:NaN};
+ assert.equal(estimateTokenCost(malformed,{input:1,cachedInput:1,cacheWrite:1,output:1}),0);
+ assert.ok(Number.isFinite(sumTokenUsage([{tokenUsage:{total:{totalTokens:Infinity,inputTokens:-5}}}]).totalTokens));
+});
+test('agent selection and token totals stay scoped to one run',()=>{
+ const agents=[{id:'a',runId:'one',tokenUsage:{total:{totalTokens:10}}},{id:'b',runId:'one',tokenUsage:{total:{totalTokens:5}}},{id:'c',runId:'two',tokenUsage:{total:{totalTokens:500}}}];
+ assert.equal(sumTokenUsage(agentsForRun(agents,'one')).totalTokens,15);
+ assert.deepEqual(agentsForRun(agents,'one').map(a=>a.id),['a','b']);
 });
 test('Sol token warning counts only Sol-model agents and accepts a disabled threshold',()=>{
  const agents=[{model:'gpt-6-luna',tokenUsage:{total:{totalTokens:900}}},{model:'gpt-6.1-sol',tokenUsage:{total:{totalTokens:2000}}}];
@@ -61,7 +71,9 @@ test('Sol token warning counts only Sol-model agents and accepts a disabled thre
 test('delegation reason is read from the explicit first-line field',()=>{
  assert.equal(delegationReason('Reason: unclear root cause\nInspect these findings'), 'unclear root cause');
  assert.equal(delegationReason('Inspect these findings'),null);
+ assert.equal(delegationReasonLabel(null),'ไม่ได้ระบุ');
  const s=createState();ensureAgent(s,'root',{runId:'r'});reduceEvent(s,'item/completed',{threadId:'root',item:{type:'collabAgentToolCall',tool:'spawnAgent',receiverThreadIds:['planner'],prompt:'Reason: cross-service data flow\nAnalyze the supplied evidence'}});assert.equal(s.agents.planner.escalationReason,'cross-service data flow');
+ reduceEvent(s,'item/completed',{threadId:'root',item:{type:'collabAgentToolCall',tool:'spawnAgent',receiverThreadIds:['explorer'],prompt:'Inspect this file'}});assert.equal(s.agents.explorer.escalationReason,null);
 });
 test('agent config smoke test pins planner to Sol, worker to Luna, and cleans only managed files on workspace change',()=>{
  const base=mkdtempSync(path.join(os.tmpdir(),'acode-agent-smoke-')),oldWorkspace=path.join(base,'old'),newWorkspace=path.join(base,'new');
@@ -89,5 +101,22 @@ test('disabled planner does not produce a custom agent file',()=>{
   const dir=path.join(workspace,'.codex','agents');
   assert.equal(existsSync(path.join(dir,'acode-planner.toml')),false);
   assert.equal(existsSync(path.join(dir,'acode-worker.toml')),true);
+ }finally{rmSync(workspace,{recursive:true,force:true});}
+});
+test('agent config update rolls back prior managed files when a later rename fails',()=>{
+ const workspace=mkdtempSync(path.join(os.tmpdir(),'acode-agent-rollback-'));
+ try{
+  const roles=roleDefaults.filter(role=>['explorer','planner'].includes(role.name)).map(role=>({...role,enabled:true}));
+  writeAgentDefinitions({workspace,roles},{workspace,roles:[]});
+  const explorer=path.join(workspace,'.codex','agents','acode-explorer.toml'),planner=path.join(workspace,'.codex','agents','acode-planner.toml');
+  const beforeExplorer=readFileSync(explorer,'utf8'),beforePlanner=readFileSync(planner,'utf8');
+  const nextRoles=roles.map(role=>({...role,description:'Changed '+role.name}));
+  let failed=false;
+  assert.throws(()=>writeAgentDefinitions({workspace,roles:nextRoles},{workspace,roles},{
+   renameSync(from,to){if(!failed&&to===planner){failed=true;throw Error('simulated planner write failure');}return renameSync(from,to);},
+   writeFileSync,unlinkSync
+  }),/rolled back/);
+  assert.equal(readFileSync(explorer,'utf8'),beforeExplorer);assert.equal(readFileSync(planner,'utf8'),beforePlanner);
+  assert.deepEqual(readdirSync(path.dirname(explorer)).filter(name=>name.includes('acode-tmp-')||name.includes('acode-rollback-')),[]);
  }finally{rmSync(workspace,{recursive:true,force:true});}
 });
